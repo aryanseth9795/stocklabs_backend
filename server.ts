@@ -1,21 +1,16 @@
-import app from "./app";
+import app from "./app.js";
 import { config } from "dotenv";
-
-
-
+import dbConnect from "./src/db/db.js";
 
 // Load environment variables
 config({ path: "./src/config/config.env" });
 
-
-
-
-
-
-
-
-
-// listen to port     
-app.listen(process.env.PORT, () => {
-  console.log("Server is running on http://localhost:3000");
+// connect to database
+if (!process.env.MONGO_URI) {
+  throw new Error("MONGO_URI is not defined in environment variables");
+}
+dbConnect(process.env.MONGO_URI);
+// listen to port
+app.listen(process.env.PORT || 5000, () => {
+  console.log(`Server is running on port ${process.env.PORT}`);
 });
