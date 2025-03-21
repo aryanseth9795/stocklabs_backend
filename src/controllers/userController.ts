@@ -12,8 +12,9 @@ export const CreateUser = TryCatch(
       password,
     });
 
-if(!result){
-  next(new ErrorHandler( "Error in creating user",400));}
+    if (!result) {
+      next(new ErrorHandler("Error in creating user", 400));
+    }
 
     res.status(200).json({
       success: true,
