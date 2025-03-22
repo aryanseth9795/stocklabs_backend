@@ -7,5 +7,4 @@ class ErrorHandler extends Error {
     Object.setPrototypeOf(this, ErrorHandler.prototype);
   }
 }
-
 export default ErrorHandler;

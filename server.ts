@@ -18,9 +18,9 @@ dbConnect(process.env.MONGO_URI);
 
 
 //Error Middleware
-
 app.use(errorMiddleware);
 
+// Listen to port
 app.listen(process.env.PORT || 5000, () => {
   console.log(`Server is running on port ${process.env.PORT}`);
 });
