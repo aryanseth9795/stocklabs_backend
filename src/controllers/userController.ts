@@ -31,7 +31,7 @@ export const LoginUser = TryCatch(
   async (req: Request, res: Response, next: NextFunction) => {
     const { email, password } = req.body;
 
-    const result = await User.findOne({ email }).select("+password");
+    const result: any = await User.findOne({ email }).select("+password");
 
     if (!result) {
       next(new ErrorHandler("Invalid Email or Password", 400));
@@ -52,3 +52,15 @@ export const LoginUser = TryCatch(
   }
 );  
     
+
+
+
+export const getMyProfile = TryCatch(
+  async (req: Request, res: Response, next: NextFunction) => {
+    const user = await User.findById(req?.user?._id);
+    res.status(200).json({
+      success: true,
+      user,
+    });
+  }
+);
