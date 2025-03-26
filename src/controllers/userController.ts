@@ -108,8 +108,8 @@ export const SellStock = TryCatch(
     }
     order.stockQuantity -= quantity;
     user.accountBalance += stockPrice * quantity;
-    await order.save(); // Save the updated order
-    await user.save(); // Save the updated user
+    await order.save(); 
+    await user.save(); 
 
     res.status(200).json({
       success: true,
