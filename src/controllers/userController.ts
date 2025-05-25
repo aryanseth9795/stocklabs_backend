@@ -84,6 +84,7 @@ export const BuyStock = TryCatch(
       stockQuantity,
       user: req.user.id,
     });
+    
 
     user && (user.accountBalance -= stockPrice * stockQuantity);
     user && (await user.save());
@@ -117,6 +118,9 @@ export const SellStock = TryCatch(
     });
   }
 );
+
+
+
 
 
 
