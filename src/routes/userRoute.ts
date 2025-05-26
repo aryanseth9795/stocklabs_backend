@@ -1,11 +1,11 @@
 
 import express from "express";
-import { get } from "http";
 import { getMyProfile } from "../controllers/userController";
 
 
 
-const Router=express.Router();
+const router=express.Router();
 
-// Router.get("/user",getMyProfile:Promise<void>);
+router.route("/me").get(getMyProfile);
+
 

@@ -1,13 +1,7 @@
-import mongoose from "mongoose";
+// src/prisma/client.ts
+import {PrismaClient} from '@prisma/client';
 
-const dbConnect = async (URL: string): Promise<void> => {
-  try {
-    const db = await mongoose.connect(URL);
-    console.log("Database Connected to " + db.connection.host);
-  } catch (error) {
-    console.log(error);
-    process.exit(1);
-  }
-};
+const prisma = new PrismaClient();
 
-export default dbConnect;
+export default prisma;
+
