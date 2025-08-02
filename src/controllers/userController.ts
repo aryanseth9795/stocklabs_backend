@@ -3,10 +3,7 @@ import prisma from "../db/db";
 import TryCatch from "../utils/Trycatch";
 import ErrorHandler from "../middlewares/ErrorHandler";
 import bcrypt from "bcrypt";
-import { AuthenticatedRequest } from "../interface/userInterface";
-import jwt from "jsonwebtoken";
 import { generateToken } from "../utils/token";
-
 export const CreateUser = TryCatch(
   async (req: Request, res: Response, next: NextFunction) => {
     const { name, email, password } = req.body;
@@ -50,13 +47,15 @@ export const CreateUser = TryCatch(
 );
 
 export const LoginUser = TryCatch(
-  async (req: Request, res: Response, next: NextFunction) => {
+  async (req: any, res: Response, next: NextFunction) => {
     const { email, password } = req.body;
 
     const result = await prisma.user.findUnique({
       where: { email },
     });
-
+    if (!email || !password) {
+      return next(new ErrorHandler("Please provide all fields", 400));
+    }
     if (!result) {
       next(new ErrorHandler("Invalid Email or Password", 400));
     }
@@ -78,7 +77,9 @@ export const LoginUser = TryCatch(
 );
 
 export const getMyProfile = TryCatch(
-  async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+  async (req: any, res: Response, next: NextFunction) => {
+    const userID = req?.user?.id;
+    // Check if user is authenticated o
     if (!req?.user?.id) {
       next(new ErrorHandler("Please login to access this resource", 401));
     }
@@ -100,8 +101,10 @@ export const getMyProfile = TryCatch(
   }
 );
 
+
+
 export const ExecuteOrder = TryCatch(
-  async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+  async (req: any, res: Response, next: NextFunction) => {
     const {
       stockName,
       stockQuantity,
@@ -192,7 +195,7 @@ export const ExecuteOrder = TryCatch(
               },
             },
           },
-        }
+        },
       });
     } catch (error) {
       await prisma.transaction.create({
@@ -229,3 +232,28 @@ export const ExecuteOrder = TryCatch(
     });
   }
 );
+
+
+export const getMyPortfolio=TryCatch(async(req:any,res:Response,next:NextFunction)=>{
+
+    const userId = req.user.id;
+
+    if (!userId) {
+        return next(new ErrorHandler("Please login to access this resource", 401));
+    }
+
+    const portfolio = await prisma.portfolio.findUnique({
+        where: { userId },
+    });
+
+    if (!portfolio) {
+        return next(new ErrorHandler("Portfolio Not Found", 404));
+    }
+
+    res.status(200).json({
+        success: true,
+        message: "Portfolio Fetched Successfully",
+        portfolio,
+    });
+
+  })

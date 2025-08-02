@@ -1,0 +1,16 @@
+/**
+ * Fixed Top-50 crypto pairs by market-cap, uppercase, USDT quotes.
+ * You can rearrange or trim without touching server code.
+ */
+export const TOP50 = [
+  "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
+  "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "SHIBUSDT", "TRXUSDT",
+  "DOTUSDT", "LINKUSDT", "MATICUSDT", "WBTCUSDT", "ICPUSDT",
+  "LTCUSDT", "BCHUSDT", "UNIUSDT", "ATOMUSDT", "ETCUSDT",
+  "HBARUSDT", "FILUSDT", "XLMUSDT", "ARBUSDT", "APTUSDT",
+  "IMXUSDT", "OKBUSDT", "VETUSDT", "MKRUSDT", "KASUSDT",
+  "RNDRUSDT", "TAOUSDT", "GRTUSDT", "NEARUSDT", "INJUSDT",
+  "OPUSDT",  "TIAUSDT", "QNTUSDT", "AAVEUSDT", "SUIUSDT",
+  "EOSUSDT", "ALGOUSDT", "JUPUSDT", "STXUSDT", "BSVUSDT",
+  "MNTUSDT", "AXSUSDT", "FLOWUSDT", "FTMUSDT", "MANAUSDT"
+];

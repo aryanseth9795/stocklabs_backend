@@ -2,6 +2,7 @@ import jwt from "jsonwebtoken";
 import { configData } from "../config/config";
 import { NextFunction } from "express";
 import ErrorHandler from "../middlewares/ErrorHandler";
+import isAuthenticated from "../middlewares/auth";
 
 const secret = process.env.JWT_SECRET || "your-secret";
 
@@ -16,14 +17,4 @@ export const generateToken = (userId: string): string => {
   return token;
 };
 
-export const verifyToken = (token: string, next:NextFunction): string | jwt.JwtPayload => {
-  const secret = configData.JWT_SECRET || "default-secret";
-  try {             
-    const decoded = jwt.verify(token, secret);
-    return decoded;
-  } catch (error) {  
-    next(new ErrorHandler("Invalid or expired token", 401));
-    return "Invalid or expired token";
-  }
-};   
 

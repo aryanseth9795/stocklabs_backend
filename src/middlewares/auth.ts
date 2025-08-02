@@ -5,7 +5,7 @@ import jwt, { JwtPayload } from "jsonwebtoken";
 import { UserPayload, AuthenticatedRequest } from "../interface/userInterface";
 
 const isAuthenticated = (
-  req: AuthenticatedRequest,
+  req: any,
   res: Response,
   next: NextFunction
 ): void => {
