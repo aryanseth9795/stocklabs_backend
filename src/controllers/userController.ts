@@ -1,9 +1,9 @@
 import { Request, Response, NextFunction } from "express";
-import prisma from "../db/db";
-import TryCatch from "../utils/Trycatch";
-import ErrorHandler from "../middlewares/ErrorHandler";
+import prisma from "../db/db.js";
+import TryCatch from "../utils/Trycatch.js";
+import ErrorHandler from "../middlewares/ErrorHandler.js";
 import bcrypt from "bcrypt";
-import { generateToken } from "../utils/token";
+import { generateToken } from "../utils/token.js";
 export const CreateUser = TryCatch(
   async (req: Request, res: Response, next: NextFunction) => {
     const { name, email, password } = req.body;
@@ -256,4 +256,8 @@ export const getMyPortfolio=TryCatch(async(req:any,res:Response,next:NextFunctio
         portfolio,
     });
 
+  })
+
+  export const check=TryCatch(async(req:any,res:Response,next:NextFunction)=>{
+    res.send("hello")
   })

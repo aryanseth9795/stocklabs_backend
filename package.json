@@ -6,14 +6,15 @@
   "type": "module",
   "scripts": {
     "build": "tsc",
-    "start": "node server.js",
-    "dev": "concurrently \"tsc -w\" \"  nodemon ./dist/server.js\" ",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node app.js",
+    "dev": "concurrently \"tsc -w\" \"  nodemon ./dist/app.js\" ",
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "postinstall": "prisma generate"
   },
   "author": "Aryan Seth",
   "license": "ISC",
   "dependencies": {
-    "@prisma/client": "^6.8.2",
+    "@prisma/client": "^6.13.0",
     "bcrypt": "^5.1.1",
     "cookie-parser": "^1.4.7",
     "dotenv": "^16.4.7",
@@ -33,6 +34,6 @@
     "@types/ws": "^8.18.1",
     "concurrently": "^9.1.2",
     "nodemon": "^3.1.9",
-    "prisma": "^6.8.2"
+    "prisma": "^6.13.0"
   }
 }

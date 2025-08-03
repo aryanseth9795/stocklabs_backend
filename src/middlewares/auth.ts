@@ -1,8 +1,8 @@
 import { Request, Response, NextFunction } from "express";
-import ErrorHandler from "./ErrorHandler";
+import ErrorHandler from "./ErrorHandler.js";
 import jwt, { JwtPayload } from "jsonwebtoken";
 
-import { UserPayload, AuthenticatedRequest } from "../interface/userInterface";
+import { UserPayload, AuthenticatedRequest } from "../interface/userInterface.js";
 
 const isAuthenticated = (
   req: any,

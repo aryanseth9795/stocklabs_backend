@@ -1,29 +1,29 @@
 
-import ErrorHandler from "../middlewares/ErrorHandler.js";
-import { NextFunction } from "express";
-import jwt, { decode } from "jsonwebtoken";
-import { configData } from "../config/config.js";
-export const socketAuthenticator = async (err:ErrorHandler, socket, next:NextFunction) => {
-  try {
-    if (err) return next(err);
+// import ErrorHandler from "../middlewares/ErrorHandler.js";
+// import { NextFunction } from "express";
+// import jwt, { decode } from "jsonwebtoken";
 
-    const authToken = socket.request.cookies["token"];
+// export const socketAuthenticator = async (err:ErrorHandler, socket, next:NextFunction) => {
+//   try {
+//     if (err) return next(err);
 
-    if (!authToken)
-      return next(new ErrorHandler("Please login to access this route", 401));
+//     const authToken = socket.request.cookies["token"];
 
-    const decodedData= jwt.verify(authToken, configData.JWT_SECRET);
+//     if (!authToken)
+//       return next(new ErrorHandler("Please login to access this route", 401));
 
-    // const user = await User.findById(decodedData?.id);
+//     const decodedData= jwt.verify(authToken, process.env.JWT_SECRET!);
 
-    if (!user) {
-      return next(new ErrorHandler("Please login to access this route", 401));
-    }
+//     const user = await User.findById(decodedData?.id);
 
-    socket.user = user;
-    return next();
-  } catch (error) {
-    console.log(error);
-    return next(new ErrorHandler("Please login to access this route", 401));
-  }
-};
+//     if (!user) {
+//       return next(new ErrorHandler("Please login to access this route", 401));
+//     }
+
+//     socket.user = user;
+//     return next();
+//   } catch (error) {
+//     console.log(error);
+//     return next(new ErrorHandler("Please login to access this route", 401));
+//   }
+// };

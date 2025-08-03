@@ -5,14 +5,16 @@ import {
   getMyProfile,
   LoginUser,
   getMyPortfolio,
-} from "../controllers/userController";
-import isAuthenticated from "../middlewares/auth";
+  check,
+} from "../controllers/userController.js";
+import isAuthenticated from "../middlewares/auth.js";
 
 const router = express.Router();
 
 // login routes
 router.route("/signup").post(CreateUser);
-router.route("/login").post(isAuthenticated, LoginUser);
+router.route("/login").post(LoginUser);
+router.route("/check").get(check);
 
 router.use(isAuthenticated);
 
