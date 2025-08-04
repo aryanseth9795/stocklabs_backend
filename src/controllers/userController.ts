@@ -11,9 +11,6 @@ export const CreateUser = TryCatch(
     const existingUser = await prisma.user.findUnique({
       where: { email },
     });
-    if (existingUser) {
-      return next(new ErrorHandler("User Already Exists", 400));
-    }
     if (!name || !email || !password) {
       return next(new ErrorHandler("Please provide all fields", 400));
     }
@@ -22,14 +19,16 @@ export const CreateUser = TryCatch(
         new ErrorHandler("Password must be at least 6 characters", 400)
       );
     }
+    if (existingUser) {
+      return next(new ErrorHandler("User Already Exists", 400));
+    }
+
     const hashedPassword = await bcrypt.hash(password, 10);
     if (!hashedPassword) {
       return next(new ErrorHandler("Error in hashing password", 400));
     }
     const result = await prisma.user.create({
-      name,
-      email,
-      password: hashedPassword,
+      data: { name, email, password: hashedPassword },
     });
 
     if (!result) {
@@ -47,7 +46,7 @@ export const CreateUser = TryCatch(
 );
 
 export const LoginUser = TryCatch(
-  async (req: any, res: Response, next: NextFunction) => {
+  async (req: Request, res: Response, next: NextFunction) => {
     const { email, password } = req.body;
 
     const result = await prisma.user.findUnique({
@@ -57,7 +56,7 @@ export const LoginUser = TryCatch(
       return next(new ErrorHandler("Please provide all fields", 400));
     }
     if (!result) {
-      next(new ErrorHandler("Invalid Email or Password", 400));
+      return next(new ErrorHandler("Invalid Email or Password", 400));
     }
 
     const isPasswordMatched = await bcrypt.compare(password, result?.password);
@@ -66,7 +65,7 @@ export const LoginUser = TryCatch(
       next(new ErrorHandler("Invalid Email or Password", 400));
     }
     //sending token
-    const token = generateToken(result.id);
+    const token = generateToken(result?.id!);
 
     res.status(200).json({
       success: true,
@@ -77,20 +76,20 @@ export const LoginUser = TryCatch(
 );
 
 export const getMyProfile = TryCatch(
-  async (req: any, res: Response, next: NextFunction) => {
-    const userID = req?.user?.id;
+  async (req: Request, res: Response, next: NextFunction) => {
+    const userID = req?.user?.id!;
     // Check if user is authenticated o
     if (!req?.user?.id) {
       next(new ErrorHandler("Please login to access this resource", 401));
     }
 
-    const user = await prisma.user.findUnique({ where: { id: req.user.id } });
+    const user = await prisma.user.findUnique({ where: { id: req?.user?.id } });
     if (!user) {
       return next(new ErrorHandler("User Not Found", 404));
     }
     // Exclude password from the response
-    const withoutPassword = { ...user };
-    delete withoutPassword.password;
+    const withoutPassword: any = { ...user };
+    delete withoutPassword?.password;
     // Return the user data without the password
 
     res.status(200).json({
@@ -101,10 +100,8 @@ export const getMyProfile = TryCatch(
   }
 );
 
-
-
 export const ExecuteOrder = TryCatch(
-  async (req: any, res: Response, next: NextFunction) => {
+  async (req: Request, res: Response, next: NextFunction) => {
     const {
       stockName,
       stockQuantity,
@@ -118,27 +115,30 @@ export const ExecuteOrder = TryCatch(
       return next(new ErrorHandler("Please provide all fields", 400));
     }
     const user = await prisma.user.findUnique({
-      where: { id: req.user.id },
+      where: { id: req.user!.id },
     });
-    if (stockPrice * stockQuantity > user?.balance) {
+    if (stockPrice * stockQuantity > user?.balance!) {
       return next(new ErrorHandler("Insufficient balance", 400));
     }
 
+    if (!user!.id) {
+      return next(new ErrorHandler("User Not Found", 404));
+    }
     // creating transaction
     try {
       const result = await prisma.transaction.create({
         data: {
-          userId: user?.id,
-          openingBalance: user?.balance,
+          userId: req.user!.id,
+          openingBalance: user?.balance!,
           closingBalance:
             type === "sell"
-              ? user?.balance + stockPrice * stockQuantity
-              : user?.balance - stockPrice * stockQuantity,
+              ? user?.balance! + stockPrice * stockQuantity
+              : user?.balance! - stockPrice * stockQuantity,
+          usedBalance: stockPrice * stockQuantity,
+          type: type === "buy" ? "withdrawal" : "deposit",
+          status: "success",
+          currency,
         },
-        usedBalance: stockPrice * stockQuantity,
-        type: type === "buy" ? "withdrawal" : "deposit",
-        status: "success",
-        currency,
       });
 
       if (!result) {
@@ -150,8 +150,8 @@ export const ExecuteOrder = TryCatch(
         data: {
           balance:
             type === "sell"
-              ? user?.balance + stockPrice * stockQuantity
-              : user?.balance - stockPrice * stockQuantity,
+              ? user?.balance! + stockPrice * stockQuantity
+              : user?.balance! - stockPrice * stockQuantity,
         },
       });
       if (!updatedUser) {
@@ -160,7 +160,7 @@ export const ExecuteOrder = TryCatch(
       // creating order
       const order = await prisma.order.create({
         data: {
-          userId: user?.id,
+          userId: req.user!.id,
           stockName,
           stockQuantity,
           stockPrice,
@@ -174,7 +174,7 @@ export const ExecuteOrder = TryCatch(
       });
 
       const userPortfolio = await prisma.portfolio.upsert({
-        where: { userId: user?.id },
+        where: { userId: req.user?.id },
         update: {
           stocks: {
             upsert: {
@@ -201,8 +201,8 @@ export const ExecuteOrder = TryCatch(
       await prisma.transaction.create({
         data: {
           userId: user?.id,
-          openingBalance: user?.balance,
-          closingBalance: user?.balance,
+          openingBalance: user!?.balance,
+          closingBalance: user!?.balance,
           usedBalance: stockPrice * stockQuantity,
           type: type === "buy" ? "withdrawal" : "deposit",
           status: "failed",
@@ -233,31 +233,26 @@ export const ExecuteOrder = TryCatch(
   }
 );
 
-
-export const getMyPortfolio=TryCatch(async(req:any,res:Response,next:NextFunction)=>{
-
-    const userId = req.user.id;
-
-    if (!userId) {
-        return next(new ErrorHandler("Please login to access this resource", 401));
-    }
-
-    const portfolio = await prisma.portfolio.findUnique({
-        where: { userId },
+export const getMyPortfolio = TryCatch(
+  async (req: Request, res: Response, next: NextFunction) => {
+    const portfolio = await prisma.portfolio.findMany({
+      where: { userId: req.user!.id },
     });
 
     if (!portfolio) {
-        return next(new ErrorHandler("Portfolio Not Found", 404));
+      return next(new ErrorHandler("Portfolio Not Found", 404));
     }
 
     res.status(200).json({
-        success: true,
-        message: "Portfolio Fetched Successfully",
-        portfolio,
+      success: true,
+      message: "Portfolio Fetched Successfully",
+      portfolio,
     });
+  }
+);
 
-  })
-
-  export const check=TryCatch(async(req:any,res:Response,next:NextFunction)=>{
-    res.send("hello")
-  })
+export const check = TryCatch(
+  async (req: any, res: Response, next: NextFunction) => {
+    res.send("hello");
+  }
+);

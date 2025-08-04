@@ -1,32 +1,33 @@
 import { Request, Response, NextFunction } from "express";
 import ErrorHandler from "./ErrorHandler.js";
-import jwt, { JwtPayload } from "jsonwebtoken";
+import jwt from "jsonwebtoken";
 
-import { UserPayload, AuthenticatedRequest } from "../interface/userInterface.js";
+import { UserPayload } from "../interface/userInterface.js";
 
 const isAuthenticated = (
-  req: any,
+  req: Request,
   res: Response,
   next: NextFunction
 ): void => {
   const token = req.headers.authorization;
-  const secret = process.env.JWT_SECRET;
+  const secret = process.env.JWT_SECRET!;
 
   if (!token) {
     return next(new ErrorHandler("Please login to access this resource", 401));
   }
 
-  if (!secret) {
-    return next(new ErrorHandler("Please login to access this resource", 401));
-  }
-
-  const decoded: UserPayload = jwt.verify(token, secret);
+  const decoded = jwt.verify(token, secret);
 
   if (!decoded) {
     return next(new ErrorHandler("Please login to access this resource", 401));
   }
 
-  req.user.id = decoded;
+  if (req.user) req.user.id = decoded;
+  else {
+    req.user = {
+      id: decoded,
+    };
+  }
   next();
 };
 
