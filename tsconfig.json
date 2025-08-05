@@ -106,7 +106,9 @@
     "skipLibCheck": true                                 /* Skip type checking all .d.ts files. */
   },
    "include": [
-    "src/**/*",
+    "app.ts",
+   "prisma/**/*.ts",
+   "src/**/*",
     "src/types/**/*.d.ts"
   ]
 //  "ts-node": { "esm": true } 
