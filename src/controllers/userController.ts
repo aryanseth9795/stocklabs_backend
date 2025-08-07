@@ -7,14 +7,17 @@ import { generateToken } from "../utils/token.js";
 import { TradeRequestBody } from "../interface/userInterface.js";
 import { Prisma } from "@prisma/client";
 
-
 // Starting of Controller
 
-
 export const CreateUser = TryCatch(
-  async (req: Request, res: Response, next: NextFunction) => {
+  async (
+    req: Request<{}, {}, Prisma.UserCreateInput>,
+    res: Response,
+    next: NextFunction
+  ) => {
+    console.log("api hitted");
+    console.log(req.body);
     const { name, email, password } = req.body;
-
     const existingUser = await prisma.user.findUnique({
       where: { email },
     });
@@ -44,10 +47,12 @@ export const CreateUser = TryCatch(
 
     //sending token
     const token = generateToken(result.id);
-    res.status(200).json({
+    // console.log(token);
+    console.log(result);
+    // console.log(req.body);
+    res.status(200).cookie("token", token, { httpOnly: true }).json({
       success: true,
       message: "Account Created Successfully",
-      token,
     });
   }
 );
@@ -74,10 +79,9 @@ export const LoginUser = TryCatch(
     //sending token
     const token = generateToken(result?.id!);
 
-    res.status(200).json({
+    res.status(200).cookie("token", token, { httpOnly: true }).json({
       success: true,
       message: "Login Successfully",
-      token,
     });
   }
 );
@@ -244,108 +248,109 @@ export const ExecuteOrder = TryCatch(
     next: NextFunction
   ) => {
     const { userId, stockName, quantity, rate, type } = req.body;
-    const txRecord = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
-      // 1) Fetch user
-      const user = await tx.user.findUnique({ where: { id: userId } });
-      if (!user) throw new Error("User not found");
+    const txRecord = await prisma.$transaction(
+      async (tx: Prisma.TransactionClient) => {
+        // 1) Fetch user
+        const user = await tx.user.findUnique({ where: { id: userId } });
+        if (!user) throw new Error("User not found");
 
-      const cost = quantity * rate;
-      const openingBalance = user.balance;
-      let closingBalance: number;
+        const cost = quantity * rate;
+        const openingBalance = user.balance;
+        let closingBalance: number;
 
-      // 2) Buy vs Sell logic
-      if (type === "buy") {
-        if (openingBalance < cost)
-          return new ErrorHandler("Insufficient balance", 400);
+        // 2) Buy vs Sell logic
+        if (type === "buy") {
+          if (openingBalance < cost)
+            return new ErrorHandler("Insufficient balance", 400);
 
-        const existing = await tx.portfolio.findFirst({
-          where: { userId, stockName },
+          const existing = await tx.portfolio.findFirst({
+            where: { userId, stockName },
+          });
+
+          closingBalance = openingBalance - cost;
+
+          if (existing) {
+            await tx.portfolio.update({
+              where: { id: existing.id },
+              data: {
+                stockQuantity: existing.stockQuantity + quantity,
+                stockTotal: existing.stockTotal + cost,
+              },
+            });
+          } else {
+            await tx.portfolio.create({
+              data: {
+                userId,
+                stockName,
+                stockPrice: rate,
+                stockQuantity: quantity,
+                stockSymbol: stockName,
+                stockTotal: cost,
+              },
+            });
+          }
+        } else {
+          // -- sell
+          const existing = await tx.portfolio.findFirst({
+            where: { userId, stockName },
+          });
+          if (!existing || existing.stockQuantity < quantity) {
+            return new ErrorHandler(`Not enough ${stockName} to sell`, 400);
+          }
+
+          if (existing.stockQuantity === quantity) {
+            // sold entire holding → delete record
+            await tx.portfolio.delete({ where: { id: existing.id } });
+          } else {
+            // sold a portion → subtract quantity
+            await tx.portfolio.update({
+              where: { id: existing.id },
+              data: { stockQuantity: existing.stockQuantity - quantity },
+            });
+          }
+
+          closingBalance = openingBalance + cost;
+        }
+
+        // 3) Update user balance
+        await tx.user.update({
+          where: { id: userId },
+          data: { balance: closingBalance },
         });
 
-        closingBalance = openingBalance - cost;
-
-        if (existing) {
-          await tx.portfolio.update({
-            where: { id: existing.id },
-            data: {
-              stockQuantity: existing.stockQuantity + quantity,
-              stockTotal: existing.stockTotal + cost,
-            },
-          });
-        } else {
-          await tx.portfolio.create({
-            data: {
-              userId,
-              stockName,
-              stockPrice: rate,
-              stockQuantity: quantity,
-              stockSymbol: stockName,
-              stockTotal: cost,
-            },
-          });
-        }
-      } else {
-        // -- sell
-        const existing = await tx.portfolio.findFirst({
-          where: { userId, stockName },
+        // 4) Record Transaction
+        const transaction = await tx.transaction.create({
+          data: {
+            userId,
+            openingBalance,
+            closingBalance,
+            usedBalance: cost,
+            type: type === "buy" ? "withdrawal" : "deposit",
+            status: "completed",
+          },
         });
-        if (!existing || existing.stockQuantity < quantity) {
-          return new ErrorHandler(`Not enough ${stockName} to sell`, 400);
-        }
 
-        if (existing.stockQuantity === quantity) {
-          // sold entire holding → delete record
-          await tx.portfolio.delete({ where: { id: existing.id } });
-        } else {
-          // sold a portion → subtract quantity
-          await tx.portfolio.update({
-            where: { id: existing.id },
-            data: { stockQuantity: existing.stockQuantity - quantity },
-          });
-        }
-
-        closingBalance = openingBalance + cost;
+        // 5) Record Order
+        await tx.order.create({
+          data: {
+            userId,
+            transactionId: transaction.id,
+            stockSymbol: stockName,
+            stockName,
+            stockPrice: rate,
+            stockQuantity: quantity,
+            stockTotal: cost,
+            status: "completed",
+            type,
+            description:
+              type === "buy"
+                ? `Bought ${quantity} ${stockName} @ ${rate}`
+                : `Sold ${quantity} ${stockName} @ ${rate}`,
+          },
+        });
+        return transaction;
       }
-
-      // 3) Update user balance
-      await tx.user.update({
-        where: { id: userId },
-        data: { balance: closingBalance },
-      });
-
-      // 4) Record Transaction
-      const transaction = await tx.transaction.create({
-        data: {
-          userId,
-          openingBalance,
-          closingBalance,
-          usedBalance: cost,
-          type: type === "buy" ? "withdrawal" : "deposit",
-          status: "completed",
-         
-        },
-      });
-
-      // 5) Record Order
-      await tx.order.create({
-        data: {
-          userId,
-          transactionId: transaction.id,
-          stockSymbol: stockName,
-          stockName,
-          stockPrice: rate,
-          stockQuantity: quantity,
-          stockTotal: cost,
-          status: "completed",
-          type,
-          description:
-            type === "buy"
-              ? `Bought ${quantity} ${stockName} @ ${rate}`
-              : `Sold ${quantity} ${stockName} @ ${rate}`,
-        },
-      });
-      return transaction;
-    });
+    );
 
     res.json({ message: "Transaction successful", transaction: txRecord });
   }
@@ -365,6 +370,45 @@ export const getMyPortfolio = TryCatch(
       success: true,
       message: "Portfolio Fetched Successfully",
       portfolio,
+    });
+  }
+);
+
+export const getMyTransactions = TryCatch(
+  async (req: Request, res: Response, next: NextFunction) => {
+    const transactions = await prisma.transaction.findMany({
+      where: { userId: req.user!.id },
+      orderBy: { createdAt: "desc" },
+      take: 20,
+    });
+
+    if (!transactions) {
+      return next(new ErrorHandler("Transactions Not Found", 404));
+    }
+
+    res.status(200).json({
+      success: true,
+      message: "Transactions Fetched Successfully",
+      transactions,
+    });
+  }
+);
+
+export const getMyOrders = TryCatch(
+  async (req: Request, res: Response, next: NextFunction) => {
+    const orders = await prisma.order.findMany({
+      where: { userId: req.user!.id },
+      orderBy: { createdAt: "desc" },
+      take: 20,
+    });
+
+    if (!orders) {
+      return next(new ErrorHandler("Orders Not Found", 404));
+    }
+    res.status(200).json({
+      success: true,
+      message: "Orders Fetched Successfully",
+      orders,
     });
   }
 );

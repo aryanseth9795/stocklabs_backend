@@ -6,6 +6,8 @@ import {
   LoginUser,
   getMyPortfolio,
   check,
+  getMyOrders,
+  getMyTransactions,
 } from "../controllers/userController.js";
 import isAuthenticated from "../middlewares/auth.js";
 
@@ -19,8 +21,10 @@ router.route("/check").get(check);
 router.use(isAuthenticated);
 
 //profile routes
-router.get("/me", getMyProfile);
-router.get("/portfolio", getMyPortfolio);
+router.route("/me").get(getMyProfile);
+router.route("/portfolio").get(getMyPortfolio);
+router.route("/tradeHistory").get(getMyOrders);
+router.route("/transactions").get(getMyTransactions);
 
 // order execution route
 router.route("/execute").post(ExecuteOrder);
