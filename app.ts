@@ -5,7 +5,7 @@
 // ◆ Publishes each tick on Redis Pub/Sub (horizontal scaling).
 // ◆ Maintains an in-memory **Top-50 board** (depth mid-price only).
 // ◆ Every client automatically receives the board; portfolio symbols are optional.
-//-----------------------------------------------------------------
+
 
 import { createServer } from "http";
 import express from "express";
@@ -16,7 +16,6 @@ import { Server } from "socket.io";
 import RedisPkg from "ioredis";
 import WebSocket from "ws";
 import jwt from "jsonwebtoken";
-
 import errorMiddleware from "./src/middlewares/errorMiddleware.js";
 import { TOP50 } from "./src/constants/StockList.js";
 import userRoute from "./src/routes/userRoute.js";
@@ -49,7 +48,7 @@ const io = new Server(server, {
   cors: { origin: [CLIENT_URL], credentials: true },
 });
 
-//// in-memory board cache
+//in-memory board cache
 const boardCache: Record<string, Row> = {};
 const boardSnapshot = () => BOARD.map((s) => boardCache[s]).filter(Boolean);
 
@@ -66,24 +65,26 @@ async function logTop50FromRedis() {
 
 // log once on startup, then every minute
 logTop50FromRedis().catch(console.error);
-setInterval(() => logTop50FromRedis().catch(console.error), 600 * 1000);
+setInterval(() => logTop50FromRedis().catch(console.error), 10 * 1000);
 
 //// normalize incoming ticker data
 function normaliseTicker(t: any): Row {
   const priceUsd = +t.c;
   const changeUsd = +t.p;
   return {
-    name: `${t.s.toLowerCase()}`,
-    price: priceUsd,
-    priceInr: +(priceUsd * USD_INR).toFixed(2),
-    change: changeUsd,
-    changeInr: +(changeUsd * USD_INR).toFixed(2),
-    pct: +t.P,
+     stockName: `${t.s.toLowerCase()}`,
+     stocksymbol: t.s,
+    stockPrice: priceUsd,
+    stockPriceINR: +(priceUsd * USD_INR).toFixed(2),
+    stockChange: changeUsd,
+    stockChangeINR: +(changeUsd * USD_INR).toFixed(2),
+    stockChangePercentage: +t.P,
     ts: new Date().toLocaleTimeString(),
   };
 }
 
 const liveUpstream = new Set<string>(BOARD);
+
 function subscribeUpstream(symbols: string[]) {
   const params = symbols
     .filter((sym) => !liveUpstream.has(sym))
@@ -103,8 +104,8 @@ upstream.on("message", async (buf) => {
   const row = normaliseTicker(data);
   await rCmd
     .pipeline()
-    .set(`tick:${row.name}`, JSON.stringify(row))
-    .publish(`tick.${row.name}`, JSON.stringify(row))
+    .set(`tick:${row.stockName}`, JSON.stringify(row))
+    .publish(`tick.${row.stockName}`, JSON.stringify(row))
     .exec();
 });
 
@@ -112,8 +113,8 @@ upstream.on("message", async (buf) => {
 rSub.psubscribe("tick.*");
 rSub.on("pmessage", (_pattern: string, _channel: string, raw: string) => {
   const row: Row = JSON.parse(raw);
-  const sym = row.name.split("-")[0].toUpperCase();
-  io.to(row.name).emit("tick", row);
+  const sym = row.stockName.split("-")[0].toUpperCase();
+  io.to(row.stockName).emit("tick", row);
   if (BOARD.includes(sym)) {
     boardCache[sym] = row;
     io.to("top50").emit("board", boardSnapshot());
@@ -129,8 +130,10 @@ setInterval(
       time: new Date().toLocaleTimeString(),
       users: userSockets.size,
       guests: guestSockets.size,
+      total: userSockets.size + guestSockets.size,
+      id: guestSockets.size ? Array.from(guestSockets)[0] : null,
     }),
-  300_000
+  10_000
 );
 
 //// socket auth & connection
@@ -154,8 +157,16 @@ io.on("connection", async (sock) => {
     guestSockets.add(sock.id);
   }
 
-  sock.join("top50");
-  sock.emit("board", boardSnapshot());
+  // sock.join("top50");
+  // sock.emit("board", boardSnapshot());
+
+  sock.on("landing", async () => {
+    console.log("landing");
+    sock.emit("landing", boardSnapshot());
+    setInterval(() => {
+    sock.emit("landing", boardSnapshot());
+    }, 2000);
+  });
 
   if (uid) {
     const symbols = await getPortfolioSymbols(uid);
@@ -172,6 +183,7 @@ io.on("connection", async (sock) => {
   });
 });
 
+// const boardSnapshot = () => Object.values(boardCache);
 async function getPortfolioSymbols(userId: string): Promise<string[]> {
   return []; // TODO: replace with real DB query
 }
