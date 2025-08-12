@@ -46,12 +46,10 @@ model Portfolio {
 model Transaction {
   id     String @id @default(cuid())
   userId String
-
   openingBalance Float
   closingBalance Float
   usedBalance    Float
   type           String // 'deposit' or 'withdrawal'
-
   status    String // 'completed', 'pending', 'failed'
   // currency  String
   createdAt DateTime @default(now())

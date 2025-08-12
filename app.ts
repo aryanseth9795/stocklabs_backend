@@ -65,7 +65,7 @@ async function logTop50FromRedis() {
 
 // log once on startup, then every minute
 logTop50FromRedis().catch(console.error);
-setInterval(() => logTop50FromRedis().catch(console.error), 10 * 1000);
+setInterval(() => logTop50FromRedis().catch(console.error), 60 * 1000);
 
 //// normalize incoming ticker data
 function normaliseTicker(t: any): Row {
@@ -133,7 +133,7 @@ setInterval(
       total: userSockets.size + guestSockets.size,
       id: guestSockets.size ? Array.from(guestSockets)[0] : null,
     }),
-  10_000
+  60 * 1_000
 );
 
 //// socket auth & connection

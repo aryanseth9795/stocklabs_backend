@@ -9,6 +9,19 @@ import { Prisma } from "@prisma/client";
 
 // Starting of Controller
 
+const cookie_Expiry: number = Number(process.env.COOKIE_EXPIRY) || 3;
+const MODE: string = String(process.env.NODE_ENV) || "PRODUCTION";
+
+const cookieOptions = {
+  maxAge: cookie_Expiry * 24 * 60 * 60 * 1000 || 3 * 24 * 60 * 60 * 1000,
+  httpOnly: true,
+  secure: MODE !== "DEVELOPMENT",
+sameSite: (MODE !== "DEVELOPMENT" ? "none" : "lax") as "none" | "lax",
+  // path: "/app/home",
+};
+
+
+
 export const CreateUser = TryCatch(
   async (
     req: Request<{}, {}, Prisma.UserCreateInput>,
@@ -50,7 +63,7 @@ export const CreateUser = TryCatch(
     // console.log(token);
     console.log(result);
     // console.log(req.body);
-    res.status(200).cookie("token", token, { httpOnly: true }).json({
+    res.status(200).cookie("token", token, cookieOptions).json({
       success: true,
       message: "Account Created Successfully",
     });
@@ -79,16 +92,18 @@ export const LoginUser = TryCatch(
     //sending token
     const token = generateToken(result?.id!);
 
-    res.status(200).cookie("token", token, { httpOnly: true }).json({
+
+    res.status(200).cookie("token", token, cookieOptions).json({
       success: true,
       message: "Login Successfully",
+      token,
     });
   }
 );
 
 export const getMyProfile = TryCatch(
   async (req: Request, res: Response, next: NextFunction) => {
-    const userID = req?.user?.id!;
+
     // Check if user is authenticated o
     if (!req?.user?.id) {
       next(new ErrorHandler("Please login to access this resource", 401));
@@ -396,6 +411,7 @@ export const getMyTransactions = TryCatch(
 
 export const getMyOrders = TryCatch(
   async (req: Request, res: Response, next: NextFunction) => {
+    console.log(req.user);
     const orders = await prisma.order.findMany({
       where: { userId: req.user!.id },
       orderBy: { createdAt: "desc" },
