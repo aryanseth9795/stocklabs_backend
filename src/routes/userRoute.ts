@@ -23,7 +23,7 @@ router.use(isAuthenticated);
 //profile routes
 router.route("/me").get(getMyProfile);
 router.route("/portfolio").get(getMyPortfolio);
-router.route("/tradeHistory").get(getMyOrders);
+router.route("/tradehistory").get(getMyOrders);
 router.route("/transactions").get(getMyTransactions);
 
 // order execution route

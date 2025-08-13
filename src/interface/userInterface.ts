@@ -1,7 +1,9 @@
 
-import { JwtPayload } from "jsonwebtoken";
 
-export type UserPayload = {userId: string} & JwtPayload ;
+
+import { JwtPayload } from "jsonwebtoken";
+export type UserPayload = JwtPayload & { userId: string };
+
 
 
 

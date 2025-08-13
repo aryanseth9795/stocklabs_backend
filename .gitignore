@@ -3,3 +3,5 @@
 /src/config/config.env
 
 /generated/prisma
+
+/.env

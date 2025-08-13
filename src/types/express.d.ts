@@ -1,17 +1,12 @@
 // src/types/global.d.ts
-import { UserPayload } from '../interface/userInterface';
-
+// src/types/express.d.ts
+import "express";
 declare global {
   namespace Express {
     interface Request {
-      /** set by your auth middleware */
-      user?: {
-        id?: UserPayload;
-        // …any other properties you attach
-      };
+      user?: { id: string };
     }
   }
 }
-
-// make this file a module so TS picks it up
 export {};
+

@@ -16,11 +16,9 @@ const cookieOptions = {
   maxAge: cookie_Expiry * 24 * 60 * 60 * 1000 || 3 * 24 * 60 * 60 * 1000,
   httpOnly: true,
   secure: MODE !== "DEVELOPMENT",
-sameSite: (MODE !== "DEVELOPMENT" ? "none" : "lax") as "none" | "lax",
+  sameSite: (MODE !== "DEVELOPMENT" ? "none" : "lax") as "none" | "lax",
   // path: "/app/home",
 };
-
-
 
 export const CreateUser = TryCatch(
   async (
@@ -92,7 +90,6 @@ export const LoginUser = TryCatch(
     //sending token
     const token = generateToken(result?.id!);
 
-
     res.status(200).cookie("token", token, cookieOptions).json({
       success: true,
       message: "Login Successfully",
@@ -103,7 +100,6 @@ export const LoginUser = TryCatch(
 
 export const getMyProfile = TryCatch(
   async (req: Request, res: Response, next: NextFunction) => {
-
     // Check if user is authenticated o
     if (!req?.user?.id) {
       next(new ErrorHandler("Please login to access this resource", 401));
@@ -113,8 +109,24 @@ export const getMyProfile = TryCatch(
     if (!user) {
       return next(new ErrorHandler("User Not Found", 404));
     }
-    // Exclude password from the response
-    const withoutPassword: any = { ...user };
+  
+
+    const portfolio = await prisma.portfolio.findMany({ where: { userId: user.id } });
+
+    let totalInvested = 0;
+    const stockNames: string[] = [];
+
+    for (let i = 0; i < portfolio.length; i++) {
+      const row = portfolio[i];
+      totalInvested +=
+        typeof row.stockTotal === "number"
+          ? row.stockTotal
+          : row.stockPrice * row.stockQuantity;
+      stockNames[stockNames.length] = row.stockName;
+    }
+
+      // Exclude password from the response
+    const withoutPassword: any = { ...user ,totalInvested,stockNames};
     delete withoutPassword?.password;
     // Return the user data without the password
 
