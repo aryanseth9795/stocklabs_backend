@@ -332,7 +332,7 @@ export const ExecuteOrder = TryCatch(
             // sold a portion → subtract quantity
             await tx.portfolio.update({
               where: { id: existing.id },
-              data: { stockQuantity: existing.stockQuantity - quantity },
+              data: { stockQuantity: existing.stockQuantity - quantity,stockTotal: existing.stockTotal - cost },
             });
           }
 
@@ -352,7 +352,7 @@ export const ExecuteOrder = TryCatch(
             openingBalance,
             closingBalance,
             usedBalance: cost,
-            type: type === "buy" ? "withdrawal" : "deposit",
+            type: type === "buy" ? "Debit" : "Credit",
             status: "completed",
           },
         });
@@ -412,7 +412,7 @@ export const getMyTransactions = TryCatch(
     if (!transactions) {
       return next(new ErrorHandler("Transactions Not Found", 404));
     }
-
+    
     res.status(200).json({
       success: true,
       message: "Transactions Fetched Successfully",

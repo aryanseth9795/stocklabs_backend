@@ -51,9 +51,7 @@ model Transaction {
   usedBalance    Float
   type           String // 'deposit' or 'withdrawal'
   status    String // 'completed', 'pending', 'failed'
-  // currency  String
   createdAt DateTime @default(now())
-
   order Order? @relation("TransactionToTrade")
   user  User   @relation(fields: [userId], references: [id])
 }
