@@ -27,7 +27,7 @@ const PORT = Number(process.env.PORT) || 4000;
 const CLIENT_URL = process.env.CLIENT_URL || "http://localhost:3000";
 const REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
 const JWT_SECRET = process.env.JWT_SECRET || "dev-secret";
-const USD_INR = Number(process.env.USD_INR) || 86; // △ rupee fx
+const USD_INR = Number(process.env.USD_INR) || 86; 
 
 const Redis: any = (RedisPkg as any).default || RedisPkg;
 const rCmd = new Redis(REDIS_URL);
@@ -137,18 +137,20 @@ setInterval(
 );
 
 //// socket auth & connection
-io.use((sock, next) => {
-  const token = sock.handshake.auth?.token;
-  if (token) {
-    try {
-      sock.data.userId = String((jwt.verify(token, JWT_SECRET) as any).userId);
-    } catch {}
-  }
-  next();
-});
+// io.use((sock, next) => {
+//   const token = sock.handshake.headers.cookie?.split("=")[1];
+//   console.log("Socket auth token:", token);
+//   if (token) {
+//     try {
+//       sock.data.userId = String((jwt.verify(token, JWT_SECRET) as any).userId);
+//     } catch {}
+//   }
+//   next();
+// });
 
 io.on("connection", async (sock) => {
   const uid = sock.data.userId as string | undefined;
+  console.log("New socket connection:", sock.id, "User ID:", uid);
   if (uid) {
     if (userSockets.has(uid))
       io.sockets.sockets.get(userSockets.get(uid)!)?.disconnect();
