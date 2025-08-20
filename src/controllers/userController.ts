@@ -26,8 +26,7 @@ export const CreateUser = TryCatch(
     res: Response,
     next: NextFunction
   ) => {
-    console.log("api hitted");
-    console.log(req.body);
+   
     const { name, email, password } = req.body;
     const existingUser = await prisma.user.findUnique({
       where: { email },
