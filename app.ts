@@ -143,14 +143,63 @@ io.use((socket: Socket, next) => {
   try {
     const raw = socket.handshake.headers.cookie ?? "";
     const { token } = cookie.parse(raw);
+
     if (!token) return next();
     const { userId } = jwt.verify(token, JWT_SECRET) as { userId: string };
     socket.data.userId = String(userId);
+    console.log("Socket connected with user ID:", socket.data.userId);
     next();
   } catch {
     next();
   }
 });
+
+const PORTFOLIO_POLL_MS = 3000;
+
+type Portfolio = {
+  id: string;
+  userId: string;
+  stockSymbol: string;
+  stockQuantity: number;
+  stockPrice: number;
+  stockTotal: number;
+  createdAt: Date;
+  updatedAt: Date;
+};
+
+type User = {
+  id: string;
+  createdAt: Date;
+  updatedAt: Date;
+  name: string;
+  email: string;
+
+  balance: number;
+};
+
+async function getPortfolioSymbols(
+  userId: string
+): Promise<[User, Portfolio[], string[]]> {
+  const portfolios = await prisma.portfolio.findMany({
+    where: { userId },
+  });
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+  });
+
+  if (!user) {
+    throw new Error("User not found");
+  }
+  const userInfo = {
+    id: user.id,
+    email: user.email,
+    name: user.name,
+    createdAt: user.createdAt,
+    updatedAt: user.updatedAt,
+    balance: user.balance,
+  };
+  return [userInfo, portfolios, portfolios.map((p) => p.stockSymbol)];
+}
 
 io.on("connection", async (sock) => {
   const uid = sock.data.userId as string | undefined;
@@ -163,16 +212,6 @@ io.on("connection", async (sock) => {
     guestSockets.add(sock.id);
   }
 
-  // sock.join("top50");
-  // sock.emit("board", boardSnapshot());
-
-  // sock.on("landing", async () => {
-  //   console.log("landing");
-  //   sock.emit("landing", boardSnapshot());
-  //   setInterval(() => {
-  //     sock.emit("landing", boardSnapshot());
-  //   }, 2000);
-  // });
   sock.on("landing", () => {
     console.log("landing");
 
@@ -202,114 +241,77 @@ io.on("connection", async (sock) => {
     sock.data.landingPoll = undefined;
   });
 
-//   sock.on("portfolio", async () => {
-//     console.log("portfolio");
-//     if (uid) {
-//       const [data, symbols] = await getPortfolioSymbols(uid);
-//       const rooms = symbols.map((s) => `${s.toLowerCase()}-ticker`);
-//       rooms.forEach((r: string) => sock.join(r));
-//       subscribeUpstream(symbols);
-//       const raws = await rCmd.mget(rooms.map((r) => `tick:${r}`));
-//       raws.forEach(
-//         (r: string | null) => r && sock.emit("Port_received", JSON.parse(r))
-//       );
-//     } else {
-//       sock.emit("error", new ErrorHandler("Unauthorized: Please log in.", 401));
-//     }
-//   // });
-
-//   sock.on("disconnect", () => {
-//     // stop portfolio poller if running
-//     if (sock.data?.portfolioPoll) {
-//       clearInterval(sock.data.portfolioPoll as NodeJS.Timeout);
-//       sock.data.portfolioPoll = undefined;
-//     }
-
-//     // (optional) if you ever add a landing poller, clear it too
-//     if (sock.data?.landingPoll) {
-//       clearInterval(sock.data.landingPoll as NodeJS.Timeout);
-//       sock.data.landingPoll = undefined;
-//     }
-
-//     // your existing bookkeeping
-//     if (uid) userSockets.delete(uid);
-//     else guestSockets.delete(sock.id);
-//   });
-// });
-
-// const boardSnapshot = () => Object.values(boardCache);
-type Portfolio = {
-  id: string;
-  userId: string;
-  stockSymbol: string;
-  stockQuantity: number;
-  stockPrice: number;
-  stockTotal: number;
-  createdAt: Date;
-  updatedAt: Date;
-};
-
-
-const PORTFOLIO_POLL_MS = 1000;
-
-sock.on("portfolio", async () => {
-  console.log("portfolio");
-  if (!uid) {
-    sock.emit("error", new ErrorHandler("Unauthorized: Please log in.", 401));
-    return;
-  }
-
-  const [data, symbols] = await getPortfolioSymbols(uid);
-  const want = new Set(symbols.map((s) => s.toUpperCase()));
-
-  // helper to normalize symbol from Row
-  const symOf = (row: Row) =>
-    (row.stocksymbol || row.stockName?.split("-")[0] || "").toUpperCase();
-
-  // initial push from current board snapshot (no upstream, no redis)
-  const snapNow = boardSnapshot();
-  snapNow.forEach((row) => {
-    if (want.has(symOf(row))) sock.emit("Port_received", row);
-  });
-
-  // one-time portfolio info (you already prepared it as `data`)
-  sock.emit("Portfolio_info", data);
-
-  // avoid duplicate intervals if client re-triggers "portfolio"
-  if (sock.data?.portfolioPoll) clearInterval(sock.data.portfolioPoll as NodeJS.Timeout);
-
-  // start 1s polling from in-memory board cache only
-  sock.data = sock.data || {};
-  sock.data.portfolioPoll = setInterval(() => {
-    try {
-      const snap = boardSnapshot(); // array<Row> built from boardCache (Top50 only)
-      for (const row of snap) {
-        if (want.has(symOf(row))) {
-          sock.emit("Port_received", row);
-        }
-      }
-    } catch {
-      /* optional: log */
+  sock.on("portfolio", async () => {
+    if (!uid) {
+      sock.emit("error", new ErrorHandler("Unauthorized: Please log in.", 401));
+      return;
     }
-  }, PORTFOLIO_POLL_MS);
-});
 
-// optional manual stop
-sock.on("portfolio:stop", () => {
-  if (sock.data?.portfolioPoll) clearInterval(sock.data.portfolioPoll as NodeJS.Timeout);
-  sock.data.portfolioPoll = undefined;
-});
+    const [userdata, data, symbols] = await getPortfolioSymbols(uid);
+    const want = new Set(symbols.map((s) => s.toUpperCase()));
 
-async function getPortfolioSymbols(
-  userId: string
-): Promise<[Portfolio[], string[]]> {
-  const portfolios = await prisma.portfolio.findMany({
-    where: { userId },
+    // helper to normalize symbol from Row
+    const symOf = (row: Row) =>
+      (row.stocksymbol || row.stockName?.split("-")[0] || "").toUpperCase();
+
+    // initial push from current board snapshot (no upstream, no redis)
+    const snapNow = boardSnapshot();
+    snapNow.forEach((row) => {
+      if (want.has(symOf(row))) sock.emit("Port_received", row);
+    });
+
+    // one-time portfolio info (you already prepared it as `data`)
+
+    sock.emit("Portfolio_info", data  );
+
+    // avoid duplicate intervals if client re-triggers "portfolio"
+    if (sock.data?.portfolioPoll)
+      clearInterval(sock.data.portfolioPoll as NodeJS.Timeout);
+
+    // start 1s polling from in-memory board cache only
+    sock.data = sock.data;
+    sock.data.portfolioPoll = setInterval(() => {
+      try {
+        const snap = boardSnapshot(); // array<Row> built from boardCache (Top50 only)
+        for (const row of snap) {
+          if (want.has(symOf(row))) {
+            // console.log("Portfolio update sent to client:", row);
+            sock.emit("Port_received", row);
+          }
+        }
+      } catch (error) {
+        /* optional: log */
+        console.error("Error in portfolio polling", error);
+      }
+    }, PORTFOLIO_POLL_MS);
   });
-  return [portfolios, portfolios.map((p) => p.stockSymbol)];
-}
+
+  sock.on("portfolio:stop", () => {
+    if (sock.data?.portfolioPoll)
+      clearInterval(sock.data.portfolioPoll as NodeJS.Timeout);
+    sock.data.portfolioPoll = undefined;
+  });
+  sock.on("disconnect", () => {
+    // stop portfolio poller if running
+    if (sock.data?.portfolioPoll) {
+      clearInterval(sock.data.portfolioPoll as NodeJS.Timeout);
+      sock.data.portfolioPoll = undefined;
+    }
+
+    // (optional) if you ever add a landing poller, clear it too
+    if (sock.data?.landingPoll) {
+      clearInterval(sock.data.landingPoll as NodeJS.Timeout);
+      sock.data.landingPoll = undefined;
+    }
+
+    // your existing bookkeeping
+    if (uid) userSockets.delete(uid);
+    else guestSockets.delete(sock.id);
+  });
+});
 
 console.log("Server started");
-server.listen(PORT, () =>
-  console.log(`Relay ready on http://localhost:${PORT}  •  ₹ rate=${USD_INR}`)
-);
+
+server.listen(PORT, () => {
+  console.log(`Relay ready on http://localhost:${PORT}  •  ₹ rate=${USD_INR}`);
+});
