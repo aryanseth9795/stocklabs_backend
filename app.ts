@@ -88,16 +88,7 @@ function normaliseTicker(t: any): Row {
 
 const liveUpstream = new Set<string>(BOARD);
 
-function subscribeUpstream(symbols: string[]) {
-  const params = symbols
-    .filter((sym) => !liveUpstream.has(sym))
-    .map((sym) => `${sym.toLowerCase()}@ticker`);
-  if (!params.length) return;
-  upstream.send(
-    JSON.stringify({ method: "SUBSCRIBE", params, id: Date.now() })
-  );
-  params.forEach((p) => liveUpstream.add(p.split("@")[0].toUpperCase()));
-}
+
 
 const upstream = new WebSocket(
   `wss://fstream.binance.com/stream?streams=${BOARD_STREAM}`
@@ -154,7 +145,7 @@ io.use((socket: Socket, next) => {
   }
 });
 
-const PORTFOLIO_POLL_MS = 3000;
+const PORTFOLIO_POLL_MS = 2000;
 
 type Portfolio = {
   id: string;
@@ -173,7 +164,6 @@ type User = {
   updatedAt: Date;
   name: string;
   email: string;
-
   balance: number;
 };
 
@@ -241,49 +231,49 @@ io.on("connection", async (sock) => {
     sock.data.landingPoll = undefined;
   });
 
+  // add (optional) wire type near your other types
+  type PortfolioTickBatch = {
+    ts: string; // ISO send time
+    ticks: Row[]; // all wanted symbols in one shot
+  };
+
   sock.on("portfolio", async () => {
     if (!uid) {
       sock.emit("error", new ErrorHandler("Unauthorized: Please log in.", 401));
       return;
     }
 
-    const [userdata, data, symbols] = await getPortfolioSymbols(uid);
+    const [userdata, positions, symbols] = await getPortfolioSymbols(uid);
     const want = new Set(symbols.map((s) => s.toUpperCase()));
-
-    // helper to normalize symbol from Row
     const symOf = (row: Row) =>
       (row.stocksymbol || row.stockName?.split("-")[0] || "").toUpperCase();
 
-    // initial push from current board snapshot (no upstream, no redis)
-    const snapNow = boardSnapshot();
-    snapNow.forEach((row) => {
-      if (want.has(symOf(row))) sock.emit("Port_received", row);
-    });
+    // 1) send static data ONCE (unchanged)
+    sock.emit("Portfolio_info", { userdata, positions });
 
-    // one-time portfolio info (you already prepared it as `data`)
+    // helper to build one combined tick batch (Top-50 cache only)
+    const buildBatch = (): PortfolioTickBatch => {
+      const snap = boardSnapshot(); // array<Row> from in-memory board cache
+      const ticks = snap.filter((row) => want.has(symOf(row)));
+      return { ts: new Date().toISOString(), ticks };
+    };
 
-    sock.emit("Portfolio_info", data  );
+    // 2) initial one-shot batch (no per-symbol emits)
+    sock.emit("portfolio:batch", buildBatch());
 
-    // avoid duplicate intervals if client re-triggers "portfolio"
+    // 3) clear any old poller and start a new interval that sends ONE batch each tick
     if (sock.data?.portfolioPoll)
       clearInterval(sock.data.portfolioPoll as NodeJS.Timeout);
 
-    // start 1s polling from in-memory board cache only
-    sock.data = sock.data;
+    sock.data = sock.data || {};
     sock.data.portfolioPoll = setInterval(() => {
       try {
-        const snap = boardSnapshot(); // array<Row> built from boardCache (Top50 only)
-        for (const row of snap) {
-          if (want.has(symOf(row))) {
-            // console.log("Portfolio update sent to client:", row);
-            sock.emit("Port_received", row);
-          }
-        }
-      } catch (error) {
-        /* optional: log */
-        console.error("Error in portfolio polling", error);
+        sock.emit("portfolio:batch", buildBatch());
+        console.log("Initial portfolio batch sent:", buildBatch());
+      } catch {
+        console.log("Portfolio batch emit failed");
       }
-    }, PORTFOLIO_POLL_MS);
+    }, PORTFOLIO_POLL_MS); // set to 1000 for 1s if you want
   });
 
   sock.on("portfolio:stop", () => {
@@ -310,7 +300,7 @@ io.on("connection", async (sock) => {
   });
 });
 
-console.log("Server started");
+
 
 server.listen(PORT, () => {
   console.log(`Relay ready on http://localhost:${PORT}  •  ₹ rate=${USD_INR}`);
