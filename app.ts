@@ -29,8 +29,9 @@ config(); // load .env
 const PORT = Number(process.env.PORT) || 4000;
 const CLIENT_URL = process.env.CLIENT_URL || "http://localhost:3000";
 const REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
-const JWT_SECRET = process.env.JWT_SECRET || "dev-secret";
+const JWT_SECRET = process.env.JWT_SECRET || "aryanseth";
 const USD_INR = Number(process.env.USD_INR) || 86;
+const ENVMODE = process.env.NODE_ENV || "DEVELOPMENT";
 
 const Redis: any = (RedisPkg as any).default || RedisPkg;
 const rCmd = new Redis(REDIS_URL);
@@ -39,8 +40,27 @@ const rSub = new Redis(REDIS_URL);
 const BOARD = TOP50;
 const BOARD_STREAM = BOARD.map((s) => `${s.toLowerCase()}@ticker`).join("/");
 
+const corsOptions: {
+  origin: string[];
+  methods: string[];
+  credentials: boolean;
+  sameSite?: string;
+} = {
+  origin: ["https://stocklabs.aryanseth.in", CLIENT_URL],
+  methods: ["GET", "POST", "PUT", "DELETE"],
+  credentials: true,
+};
+
+
+
+// Setting SameSite to None in Production
+if (ENVMODE !== "DEVELOPMENT") {
+  corsOptions.sameSite = "None";
+  // cookieOptions.sameSite = "None";
+}
+
 const app = express();
-app.use(cors({ origin: [CLIENT_URL], credentials: true }));
+app.use(cors(corsOptions));
 app.use(express.json());
 app.use(cookieParser());
 app.use("/api/v1/", userRoute);
@@ -48,7 +68,10 @@ app.use(errorMiddleware);
 
 const server = createServer(app);
 const io = new Server(server, {
-  cors: { origin: [CLIENT_URL], credentials: true },
+  cors: {
+    origin: [CLIENT_URL, "https://stocklabs.aryanseth.in"],
+    credentials: true,
+  },
 });
 
 //in-memory board cache
@@ -87,8 +110,6 @@ function normaliseTicker(t: any): Row {
 }
 
 const liveUpstream = new Set<string>(BOARD);
-
-
 
 const upstream = new WebSocket(
   `wss://fstream.binance.com/stream?streams=${BOARD_STREAM}`
@@ -188,7 +209,11 @@ async function getPortfolioSymbols(
     updatedAt: user.updatedAt,
     balance: user.balance,
   };
-  return [userInfo, portfolios, portfolios.map((p: Portfolio) => p.stockSymbol as string)];
+  return [
+    userInfo,
+    portfolios,
+    portfolios.map((p: Portfolio) => p.stockSymbol as string),
+  ];
 }
 
 io.on("connection", async (sock) => {
@@ -299,8 +324,6 @@ io.on("connection", async (sock) => {
     else guestSockets.delete(sock.id);
   });
 });
-
-
 
 server.listen(PORT, () => {
   console.log(`Relay ready on http://localhost:${PORT}  •  ₹ rate=${USD_INR}`);

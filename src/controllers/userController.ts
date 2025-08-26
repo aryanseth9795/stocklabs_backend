@@ -26,7 +26,6 @@ export const CreateUser = TryCatch(
     res: Response,
     next: NextFunction
   ) => {
-   
     const { name, email, password } = req.body;
     const existingUser = await prisma.user.findUnique({
       where: { email },
@@ -108,9 +107,10 @@ export const getMyProfile = TryCatch(
     if (!user) {
       return next(new ErrorHandler("User Not Found", 404));
     }
-  
 
-    const portfolio = await prisma.portfolio.findMany({ where: { userId: user.id } });
+    const portfolio = await prisma.portfolio.findMany({
+      where: { userId: user.id },
+    });
 
     let totalInvested = 0;
     const stockNames: string[] = [];
@@ -124,8 +124,8 @@ export const getMyProfile = TryCatch(
       stockNames[stockNames.length] = row.stockName;
     }
 
-      // Exclude password from the response
-    const withoutPassword: any = { ...user ,totalInvested,stockNames};
+    // Exclude password from the response
+    const withoutPassword: any = { ...user, totalInvested, stockNames };
     delete withoutPassword?.password;
     // Return the user data without the password
 
@@ -331,7 +331,10 @@ export const ExecuteOrder = TryCatch(
             // sold a portion → subtract quantity
             await tx.portfolio.update({
               where: { id: existing.id },
-              data: { stockQuantity: existing.stockQuantity - quantity,stockTotal: existing.stockTotal - cost },
+              data: {
+                stockQuantity: existing.stockQuantity - quantity,
+                stockTotal: existing.stockTotal - cost,
+              },
             });
           }
 
@@ -411,7 +414,7 @@ export const getMyTransactions = TryCatch(
     if (!transactions) {
       return next(new ErrorHandler("Transactions Not Found", 404));
     }
-    
+
     res.status(200).json({
       success: true,
       message: "Transactions Fetched Successfully",
