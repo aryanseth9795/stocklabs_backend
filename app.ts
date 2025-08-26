@@ -33,6 +33,7 @@ const JWT_SECRET = process.env.JWT_SECRET || "aryanseth";
 const USD_INR = Number(process.env.USD_INR) || 86;
 const ENVMODE = process.env.NODE_ENV || "DEVELOPMENT";
 
+console.log(`Starting relay in ${ENVMODE} mode...`);
 const Redis: any = (RedisPkg as any).default || RedisPkg;
 const rCmd = new Redis(REDIS_URL);
 const rSub = new Redis(REDIS_URL);
@@ -46,7 +47,7 @@ const corsOptions: {
   credentials: boolean;
   sameSite?: string;
 } = {
-  origin: ["https://stocklabs.aryanseth.in", CLIENT_URL],
+  origin: ["https://stocklabs.aryanseth.in", CLIENT_URL, "http://localhost:3000"],
   methods: ["GET", "POST", "PUT", "DELETE"],
   credentials: true,
 };
