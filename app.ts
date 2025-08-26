@@ -188,7 +188,7 @@ async function getPortfolioSymbols(
     updatedAt: user.updatedAt,
     balance: user.balance,
   };
-  return [userInfo, portfolios, portfolios.map((p) => p.stockSymbol)];
+  return [userInfo, portfolios, portfolios.map((p: Portfolio) => p.stockSymbol as string)];
 }
 
 io.on("connection", async (sock) => {
