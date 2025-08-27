@@ -443,6 +443,17 @@ export const getMyOrders = TryCatch(
   }
 );
 
+export const logout = TryCatch(
+  async (req: Request, res: Response, next: NextFunction) => {
+    res
+      .cookie("token", "", {
+        httpOnly: true,
+        expires: new Date(0),
+      })
+      .json({ success: true, message: "Logout successful" });
+  }
+);
+
 export const check = TryCatch(
   async (req: any, res: Response, next: NextFunction) => {
     res.send("hello");
