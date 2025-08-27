@@ -446,10 +446,7 @@ export const getMyOrders = TryCatch(
 export const logout = TryCatch(
   async (req: Request, res: Response, next: NextFunction) => {
     res
-      .cookie("token", "", {
-        httpOnly: true,
-        expires: new Date(0),
-      })
+      .clearCookie("token", { ...cookieOptions, maxAge: 0 })
       .json({ success: true, message: "Logout successful" });
   }
 );
