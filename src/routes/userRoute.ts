@@ -20,7 +20,7 @@ const router = express.Router();
 router.route("/signup").post(CreateUser);
 router.route("/login").post(LoginUser);
 router.route("/check").get(check);
-router.route("/forget").get(forgetPassword);
+router.route("/forget").post(forgetPassword);
 
 // Apply authentication middleware
 router.use(isAuthenticated);
