@@ -456,3 +456,22 @@ export const check = TryCatch(
     res.send("hello");
   }
 );
+
+export const forgetPassword = TryCatch(
+  async (req: Request, res: Response, next: NextFunction) => {
+    const { email, password } = req.body;
+    const user = await prisma.user.findUnique({ where: { email } });
+    if (!user) {
+      return next(new ErrorHandler("User not found", 404));
+    }
+    user.password = await bcrypt.hash(password, 10);
+    await prisma.user.update({
+      where: { email },
+      data: { password: user.password },
+    });
+    res.status(200).json({
+      success: true,
+      message: "Password reset successfully ",
+    });
+  }
+);

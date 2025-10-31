@@ -9,6 +9,7 @@ import {
   getMyOrders,
   getMyTransactions,
   logout,
+  forgetPassword,
 } from "../controllers/userController.js";
 import isAuthenticated from "../middlewares/auth.js";
 
@@ -29,6 +30,7 @@ router.route("/portfolio").get(getMyPortfolio);
 router.route("/tradehistory").get(getMyOrders);
 router.route("/transactions").get(getMyTransactions);
 router.route("/logout").get(logout);
+router.route("/forget").get(forgetPassword);
 
 // order execution route
 router.route("/execute").post(ExecuteOrder);
