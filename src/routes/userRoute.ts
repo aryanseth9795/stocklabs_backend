@@ -20,6 +20,7 @@ const router = express.Router();
 router.route("/signup").post(CreateUser);
 router.route("/login").post(LoginUser);
 router.route("/check").get(check);
+router.route("/forget").get(forgetPassword);
 
 // Apply authentication middleware
 router.use(isAuthenticated);
@@ -30,7 +31,6 @@ router.route("/portfolio").get(getMyPortfolio);
 router.route("/tradehistory").get(getMyOrders);
 router.route("/transactions").get(getMyTransactions);
 router.route("/logout").get(logout);
-router.route("/forget").get(forgetPassword);
 
 // order execution route
 router.route("/execute").post(ExecuteOrder);
