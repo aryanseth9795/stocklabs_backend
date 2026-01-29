@@ -10,17 +10,18 @@ import {
   getMyTransactions,
   logout,
   forgetPassword,
+  refreshToken,
 } from "../controllers/userController.js";
 import isAuthenticated from "../middlewares/auth.js";
 
-
 const router = express.Router();
 
-// login routes
+// login routes (public - no auth required)
 router.route("/signup").post(CreateUser);
 router.route("/login").post(LoginUser);
 router.route("/check").get(check);
 router.route("/forget").post(forgetPassword);
+router.route("/refresh").post(refreshToken);
 
 // Apply authentication middleware
 router.use(isAuthenticated);

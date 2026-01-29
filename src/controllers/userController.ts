@@ -3,7 +3,11 @@ import prisma from "../db/db.js";
 import TryCatch from "../utils/Trycatch.js";
 import ErrorHandler from "../middlewares/ErrorHandler.js";
 import bcrypt from "bcrypt";
-import { generateToken } from "../utils/token.js";
+import {
+  generateToken,
+  generateTokenPair,
+  verifyRefreshToken,
+} from "../utils/token.js";
 import { TradeRequestBody } from "../interface/userInterface.js";
 import { Prisma } from "@prisma/client";
 
@@ -24,7 +28,7 @@ export const CreateUser = TryCatch(
   async (
     req: Request<{}, {}, Prisma.UserCreateInput>,
     res: Response,
-    next: NextFunction
+    next: NextFunction,
   ) => {
     const { name, email, password } = req.body;
     const existingUser = await prisma.user.findUnique({
@@ -35,7 +39,7 @@ export const CreateUser = TryCatch(
     }
     if (password.length < 6) {
       return next(
-        new ErrorHandler("Password must be at least 6 characters", 400)
+        new ErrorHandler("Password must be at least 6 characters", 400),
       );
     }
     if (existingUser) {
@@ -54,16 +58,19 @@ export const CreateUser = TryCatch(
       next(new ErrorHandler("Error in creating User", 400));
     }
 
-    //sending token
+    //sending tokens
     const token = generateToken(result.id);
-    // console.log(token);
+    const { accessToken, refreshToken } = generateTokenPair(result.id);
     console.log(result);
-    // console.log(req.body);
+
+    // Set cookie for web clients, return tokens for mobile
     res.status(200).cookie("token", token, cookieOptions).json({
       success: true,
       message: "Account Created Successfully",
+      accessToken,
+      refreshToken,
     });
-  }
+  },
 );
 
 export const LoginUser = TryCatch(
@@ -83,17 +90,20 @@ export const LoginUser = TryCatch(
     const isPasswordMatched = await bcrypt.compare(password, result?.password);
 
     if (!isPasswordMatched) {
-      next(new ErrorHandler("Invalid Email or Password", 400));
+      return next(new ErrorHandler("Invalid Email or Password", 400));
     }
-    //sending token
+    //sending tokens
     const token = generateToken(result?.id!);
+    const { accessToken, refreshToken } = generateTokenPair(result?.id!);
 
+    // Set cookie for web clients, return tokens for mobile
     res.status(200).cookie("token", token, cookieOptions).json({
       success: true,
       message: "Login Successfully",
-      token,
+      accessToken,
+      refreshToken,
     });
-  }
+  },
 );
 
 export const getMyProfile = TryCatch(
@@ -134,7 +144,7 @@ export const getMyProfile = TryCatch(
       message: "Profile Fetched Successfully",
       user: withoutPassword,
     });
-  }
+  },
 );
 
 // export const ExecuteOrder = TryCatch(
@@ -271,7 +281,7 @@ export const ExecuteOrder = TryCatch(
   async (
     req: Request<{}, {}, TradeRequestBody>,
     res: Response,
-    next: NextFunction
+    next: NextFunction,
   ) => {
     const { userId, stockName, quantity, rate, type } = req.body;
     const txRecord = await prisma.$transaction(
@@ -378,11 +388,11 @@ export const ExecuteOrder = TryCatch(
           },
         });
         return transaction;
-      }
+      },
     );
 
     res.json({ message: "Transaction successful", transaction: txRecord });
-  }
+  },
 );
 
 export const getMyPortfolio = TryCatch(
@@ -400,7 +410,7 @@ export const getMyPortfolio = TryCatch(
       message: "Portfolio Fetched Successfully",
       portfolio,
     });
-  }
+  },
 );
 
 export const getMyTransactions = TryCatch(
@@ -420,7 +430,7 @@ export const getMyTransactions = TryCatch(
       message: "Transactions Fetched Successfully",
       transactions,
     });
-  }
+  },
 );
 
 export const getMyOrders = TryCatch(
@@ -440,7 +450,7 @@ export const getMyOrders = TryCatch(
       message: "Orders Fetched Successfully",
       orders,
     });
-  }
+  },
 );
 
 export const logout = TryCatch(
@@ -448,13 +458,13 @@ export const logout = TryCatch(
     res
       .clearCookie("token", { ...cookieOptions, maxAge: 0 })
       .json({ success: true, message: "Logout successful" });
-  }
+  },
 );
 
 export const check = TryCatch(
   async (req: any, res: Response, next: NextFunction) => {
     res.send("hello");
-  }
+  },
 );
 
 export const forgetPassword = TryCatch(
@@ -473,5 +483,45 @@ export const forgetPassword = TryCatch(
       success: true,
       message: "Password reset successfully ",
     });
-  }
+  },
+);
+
+/**
+ * Refresh Token endpoint
+ * Generates a new access/refresh token pair using a valid refresh token
+ */
+export const refreshToken = TryCatch(
+  async (req: Request, res: Response, next: NextFunction) => {
+    const { refreshToken: token } = req.body;
+
+    if (!token) {
+      return next(new ErrorHandler("Refresh token is required", 400));
+    }
+
+    // Verify the refresh token
+    const decoded = verifyRefreshToken(token);
+    if (!decoded) {
+      return next(new ErrorHandler("Invalid or expired refresh token", 401));
+    }
+
+    // Check if user still exists
+    const user = await prisma.user.findUnique({
+      where: { id: decoded.userId },
+    });
+    if (!user) {
+      return next(new ErrorHandler("User not found", 404));
+    }
+
+    // Generate new token pair
+    const { accessToken, refreshToken: newRefreshToken } = generateTokenPair(
+      user.id,
+    );
+
+    res.status(200).json({
+      success: true,
+      message: "Token refreshed successfully",
+      accessToken,
+      refreshToken: newRefreshToken,
+    });
+  },
 );
