@@ -47,7 +47,7 @@ const corsOptions: {
   credentials: boolean;
   sameSite?: string;
 } = {
-  origin: ["https://stocklabs.aryanseth.in", CLIENT_URL, "http://localhost:3000"],
+  origin: ["https://stocklabs.aryantechie.in", CLIENT_URL],
   methods: ["GET", "POST", "PUT", "DELETE"],
   credentials: true,
 };
