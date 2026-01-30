@@ -52,8 +52,6 @@ const corsOptions: {
   credentials: true,
 };
 
-
-
 // Setting SameSite to None in Production
 if (ENVMODE !== "DEVELOPMENT") {
   corsOptions.sameSite = "None";
@@ -113,7 +111,7 @@ function normaliseTicker(t: any): Row {
 const liveUpstream = new Set<string>(BOARD);
 
 const upstream = new WebSocket(
-  `wss://fstream.binance.com/stream?streams=${BOARD_STREAM}`
+  `wss://fstream.binance.com/stream?streams=${BOARD_STREAM}`,
 );
 upstream.on("message", async (buf) => {
   const { data } = JSON.parse(buf.toString());
@@ -149,20 +147,38 @@ setInterval(
       total: userSockets.size + guestSockets.size,
       id: guestSockets.size ? Array.from(guestSockets)[0] : null,
     }),
-  60 * 1_000
+  60 * 1_000,
 );
 
 io.use((socket: Socket, next) => {
   try {
-    const raw = socket.handshake.headers.cookie ?? "";
-    const { token } = cookie.parse(raw);
+    let token: string | undefined;
 
-    if (!token) return next();
-    const { userId } = jwt.verify(token, JWT_SECRET) as { userId: string };
-    socket.data.userId = String(userId);
+    // Priority 1: Check auth object (mobile clients)
+    if (socket.handshake.auth?.token) {
+      token = socket.handshake.auth.token;
+    }
+    // Priority 2: Check query params (fallback)
+    else if (socket.handshake.query?.token) {
+      token = socket.handshake.query.token as string;
+    }
+    // Priority 3: Check cookies (web clients)
+    else {
+      const raw = socket.handshake.headers.cookie ?? "";
+      const parsed = cookie.parse(raw);
+      token = parsed.token;
+    }
+
+    if (!token) return next(); // Allow guest connections
+
+    // Try to verify token
+    const decoded = jwt.verify(token, JWT_SECRET) as { userId: string };
+    socket.data.userId = String(decoded.userId);
     console.log("Socket connected with user ID:", socket.data.userId);
     next();
-  } catch {
+  } catch (err) {
+    // Token invalid/expired - still allow connection as guest
+    console.log("Socket auth failed:", (err as Error).message);
     next();
   }
 });
@@ -190,7 +206,7 @@ type User = {
 };
 
 async function getPortfolioSymbols(
-  userId: string
+  userId: string,
 ): Promise<[User, Portfolio[], string[]]> {
   const portfolios = await prisma.portfolio.findMany({
     where: { userId },
