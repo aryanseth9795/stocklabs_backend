@@ -23,6 +23,7 @@ import ErrorHandler from "./src/middlewares/ErrorHandler.js";
 import type { Socket } from "socket.io";
 import cookie from "cookie";
 import prisma from "./src/db/db.js";
+import axios from "axios";
 
 config(); // load .env
 
@@ -62,13 +63,18 @@ const app = express();
 app.use(cors(corsOptions));
 app.use(express.json());
 app.use(cookieParser());
+
+app.get("/ping", (req, res) => {
+  res.json({ message: "Server is running" });
+});
+
 app.use("/api/v1/", userRoute);
 app.use(errorMiddleware);
 
 const server = createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: [CLIENT_URL, "https://stocklabs.aryanseth.in"],
+    origin: [CLIENT_URL, "https://stocklabs.aryantechie.in"],
     credentials: true,
   },
 });
@@ -341,6 +347,15 @@ io.on("connection", async (sock) => {
     else guestSockets.delete(sock.id);
   });
 });
+
+function ping(){
+  axios.get(process.env.API_URL  + "/ping").then((res) => {
+    console.log(res.data);
+  });
+}
+
+setInterval(ping, 12 * 1000);
+
 
 server.listen(PORT, () => {
   console.log(`Relay ready on http://localhost:${PORT}  •  ₹ rate=${USD_INR}`);
