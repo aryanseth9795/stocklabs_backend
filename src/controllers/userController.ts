@@ -602,6 +602,9 @@ export const updateProfile = TryCatch(
 // Get Profit/Loss statistics
 export const getProfitLoss = TryCatch(
   async (req: Request, res: Response, next: NextFunction) => {
+    if (!req.user) {
+      return next(new ErrorHandler("Please login first", 401));
+    }
     const userId = req.user.id;
     const { days } = req.query;
 
