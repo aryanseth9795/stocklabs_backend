@@ -354,7 +354,7 @@ function ping(){
   });
 }
 
-setInterval(ping, 12 * 1000);
+setInterval(ping, 12000);
 
 
 server.listen(PORT, () => {

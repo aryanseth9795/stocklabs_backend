@@ -525,3 +525,189 @@ export const refreshToken = TryCatch(
     });
   },
 );
+
+/**
+ * Update user profile (name and/or password)
+ */
+export const updateProfile = TryCatch(
+  async (req: Request, res: Response, next: NextFunction) => {
+    if (!req?.user?.id) {
+      return next(
+        new ErrorHandler("Please login to access this resource", 401),
+      );
+    }
+
+    const { name, currentPassword, newPassword } = req.body;
+
+    const user = await prisma.user.findUnique({ where: { id: req.user.id } });
+    if (!user) {
+      return next(new ErrorHandler("User not found", 404));
+    }
+
+    const updateData: { name?: string; password?: string } = {};
+
+    // Update name if provided
+    if (name && name.trim()) {
+      updateData.name = name.trim();
+    }
+
+    // Update password if both current and new are provided
+    if (newPassword) {
+      if (!currentPassword) {
+        return next(
+          new ErrorHandler(
+            "Current password is required to change password",
+            400,
+          ),
+        );
+      }
+
+      const isPasswordMatched = await bcrypt.compare(
+        currentPassword,
+        user.password,
+      );
+      if (!isPasswordMatched) {
+        return next(new ErrorHandler("Current password is incorrect", 400));
+      }
+
+      if (newPassword.length < 6) {
+        return next(
+          new ErrorHandler("New password must be at least 6 characters", 400),
+        );
+      }
+
+      updateData.password = await bcrypt.hash(newPassword, 10);
+    }
+
+    if (Object.keys(updateData).length === 0) {
+      return next(new ErrorHandler("No updates provided", 400));
+    }
+
+    const updatedUser = await prisma.user.update({
+      where: { id: req.user.id },
+      data: updateData,
+    });
+
+    // Exclude password from response
+    const { password: _, ...userWithoutPassword } = updatedUser;
+
+    res.status(200).json({
+      success: true,
+      message: "Profile updated successfully",
+      user: userWithoutPassword,
+    });
+  },
+);
+
+// Get Profit/Loss statistics
+export const getProfitLoss = TryCatch(
+  async (req: Request, res: Response, next: NextFunction) => {
+    const userId = req.user.id;
+    const { days } = req.query;
+
+    // Calculate date range (default: 365 days)
+    const daysNum = days ? parseInt(days as string, 10) : 365;
+    const startDate = new Date();
+    startDate.setDate(startDate.getDate() - daysNum);
+
+    // Fetch all orders within date range
+    const orders = await prisma.order.findMany({
+      where: {
+        userId,
+        status: "completed",
+        createdAt: {
+          gte: startDate,
+        },
+      },
+      orderBy: {
+        createdAt: "asc",
+      },
+    });
+
+    // Calculate P/L per symbol
+    const symbolStats: Record<
+      string,
+      {
+        totalBuy: number;
+        totalSell: number;
+        buyVolume: number;
+        sellVolume: number;
+        buyCount: number;
+        sellCount: number;
+      }
+    > = {};
+
+    for (const order of orders) {
+      const symbol = order.stockSymbol;
+
+      if (!symbolStats[symbol]) {
+        symbolStats[symbol] = {
+          totalBuy: 0,
+          totalSell: 0,
+          buyVolume: 0,
+          sellVolume: 0,
+          buyCount: 0,
+          sellCount: 0,
+        };
+      }
+
+      if (order.type === "buy") {
+        symbolStats[symbol].totalBuy += order.stockTotal;
+        symbolStats[symbol].buyVolume += order.stockQuantity;
+        symbolStats[symbol].buyCount++;
+      } else {
+        symbolStats[symbol].totalSell += order.stockTotal;
+        symbolStats[symbol].sellVolume += order.stockQuantity;
+        symbolStats[symbol].sellCount++;
+      }
+    }
+
+    // Calculate overall statistics
+    let realizedPL = 0;
+    let totalBuyAmount = 0;
+    let totalSellAmount = 0;
+    let totalBuyCount = 0;
+    let totalSellCount = 0;
+
+    const symbolBreakdown = Object.entries(symbolStats).map(
+      ([symbol, stats]) => {
+        const symbolPL = stats.totalSell - stats.totalBuy;
+        realizedPL += symbolPL;
+        totalBuyAmount += stats.totalBuy;
+        totalSellAmount += stats.totalSell;
+        totalBuyCount += stats.buyCount;
+        totalSellCount += stats.sellCount;
+
+        return {
+          symbol,
+          realizedPL: symbolPL,
+          totalBuy: stats.totalBuy,
+          totalSell: stats.totalSell,
+          buyVolume: stats.buyVolume,
+          sellVolume: stats.sellVolume,
+          buyCount: stats.buyCount,
+          sellCount: stats.sellCount,
+        };
+      },
+    );
+
+    res.status(200).json({
+      success: true,
+      data: {
+        realizedPL,
+        totalBuyAmount,
+        totalSellAmount,
+        totalBuyCount,
+        totalSellCount,
+        totalTrades: totalBuyCount + totalSellCount,
+        avgTradeSize:
+          totalBuyCount + totalSellCount > 0
+            ? (totalBuyAmount + totalSellAmount) /
+              (totalBuyCount + totalSellCount)
+            : 0,
+        symbolBreakdown,
+        period: `${daysNum} days`,
+      },
+    });
+  },
+);

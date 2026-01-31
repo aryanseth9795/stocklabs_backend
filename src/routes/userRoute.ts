@@ -11,6 +11,8 @@ import {
   logout,
   forgetPassword,
   refreshToken,
+  updateProfile,
+  getProfitLoss,
 } from "../controllers/userController.js";
 import isAuthenticated from "../middlewares/auth.js";
 
@@ -28,10 +30,14 @@ router.use(isAuthenticated);
 
 //profile routes
 router.route("/me").get(getMyProfile);
+router.route("/profile").put(updateProfile);
 router.route("/portfolio").get(getMyPortfolio);
 router.route("/tradehistory").get(getMyOrders);
 router.route("/transactions").get(getMyTransactions);
 router.route("/logout").get(logout);
+
+// statistics routes
+router.route("/stats/pl").get(getProfitLoss);
 
 // order execution route
 router.route("/execute").post(ExecuteOrder);
