@@ -18,8 +18,11 @@ import jwt from "jsonwebtoken";
 import errorMiddleware from "./src/middlewares/errorMiddleware.js";
 import { TOP50 } from "./src/constants/StockList.js";
 import userRoute from "./src/routes/userRoute.js";
+import shortRoute from "./src/routes/shortRoute.js";
+import commodityRoute from "./src/routes/commodityRoute.js";
 import { Row } from "./src/types/types.js";
 import ErrorHandler from "./src/middlewares/ErrorHandler.js";
+import { startAutoCutJob, setBoardCacheRef } from "./src/utils/autoCutJob.js";
 import type { Socket } from "socket.io";
 import cookie from "cookie";
 import prisma from "./src/db/db.js";
@@ -69,6 +72,8 @@ app.get("/ping", (req, res) => {
 });
 
 app.use("/api/v1/", userRoute);
+app.use("/api/v1/short", shortRoute);
+app.use("/api/v1/commodity", commodityRoute);
 app.use(errorMiddleware);
 
 const server = createServer(app);
@@ -79,9 +84,13 @@ const io = new Server(server, {
   },
 });
 
-//in-memory board cache
-const boardCache: Record<string, Row> = {};
+// in-memory board cache (exported so autoCutJob can access live prices)
+export const boardCache: Record<string, Row> = {};
 const boardSnapshot = () => BOARD.map((s) => boardCache[s]).filter(Boolean);
+
+// Give autoCutJob a reference to boardCache and start CRON
+setBoardCacheRef(boardCache);
+startAutoCutJob();
 
 //// helper: fetch all 50 from Redis and log
 async function logTop50FromRedis() {
@@ -348,14 +357,13 @@ io.on("connection", async (sock) => {
   });
 });
 
-function ping(){
-  axios.get(process.env.API_URL  + "/ping").then((res) => {
+function ping() {
+  axios.get(process.env.API_URL + "/ping").then((res) => {
     console.log(res.data);
   });
 }
 
 setInterval(ping, 12000);
-
 
 server.listen(PORT, () => {
   console.log(`Relay ready on http://localhost:${PORT}  •  ₹ rate=${USD_INR}`);

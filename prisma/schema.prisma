@@ -20,9 +20,11 @@ model User {
   name         String
   password     String
   balance      Float         @default(100000)
-  transactions Transaction[]
-  orders       Order[]
-  portfolios   Portfolio[]
+  transactions        Transaction[]
+  orders              Order[]
+  portfolios          Portfolio[]
+  shortPositions      ShortPosition[]
+  commodityPortfolios CommodityPortfolio[]
   createdAt    DateTime      @default(now())
   updatedAt    DateTime      @updatedAt
 }
@@ -67,6 +69,7 @@ model Order {
   stockTotal    Float
   status        String // 'completed', 'pending', 'failed'
   type          String // 'buy' or 'sell'
+  orderMode     String   @default("delivery") // 'delivery' | 'intraday' | 'short_sell' | 'short_cover'
   description   String?
   createdAt     DateTime    @default(now())
   user          User        @relation(fields: [userId], references: [id])
@@ -75,4 +78,42 @@ model Order {
   @@index([userId]) // Index for faster lookups by user
   @@index([transactionId]) // Index for faster lookups by transaction
   @@index([stockSymbol]) // Index for faster lookups by stock symbol
+}
+
+model ShortPosition {
+  id            String    @id @default(cuid())
+  userId        String
+  assetType     String    @default("crypto") // "crypto" | "commodity"
+  stockSymbol   String
+  stockName     String
+  entryPrice    Float
+  quantity      Float
+  totalValue    Float     // entryPrice * quantity (margin held)
+  status        String    @default("open") // "open" | "closed" | "auto_cut"
+  exitPrice     Float?
+  profitLoss    Float?
+  closedAt      DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  user          User      @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@index([userId, status])
+  @@index([status])
+}
+
+model CommodityPortfolio {
+  id        String   @id @default(cuid())
+  userId    String
+  symbol    String   // "GOLD" | "SILVER" | "CRUDEOIL" | "COPPER"
+  name      String
+  price     Float    // average buy price in ₹
+  quantity  Float
+  total     Float    // price * quantity
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  user      User     @relation(fields: [userId], references: [id])
+
+  @@unique([userId, symbol])
+  @@index([userId])
 }

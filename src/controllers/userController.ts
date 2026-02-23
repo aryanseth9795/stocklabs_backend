@@ -283,7 +283,14 @@ export const ExecuteOrder = TryCatch(
     res: Response,
     next: NextFunction,
   ) => {
-    const { userId, stockName, quantity, rate, type } = req.body;
+    const {
+      userId,
+      stockName,
+      quantity,
+      rate,
+      type,
+      orderMode = "delivery",
+    } = req.body as TradeRequestBody & { orderMode?: string };
     const txRecord = await prisma.$transaction(
       async (tx: Prisma.TransactionClient) => {
         // 1) Fetch user
@@ -381,6 +388,7 @@ export const ExecuteOrder = TryCatch(
             stockTotal: cost,
             status: "completed",
             type,
+            orderMode,
             description:
               type === "buy"
                 ? `Bought ${quantity} ${stockName} @ ${rate}`
