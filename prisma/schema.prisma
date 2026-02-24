@@ -19,7 +19,7 @@ model User {
   email        String        @unique
   name         String
   password     String
-  balance      Float         @default(100000)
+  balance      Float         @default(100000000)
   transactions        Transaction[]
   orders              Order[]
   portfolios          Portfolio[]

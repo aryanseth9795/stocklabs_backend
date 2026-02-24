@@ -27,6 +27,7 @@ import type { Socket } from "socket.io";
 import cookie from "cookie";
 import prisma from "./src/db/db.js";
 import axios from "axios";
+import { initExchangeRate, getUsdInrRate } from "./src/utils/exchangeRate.js";
 
 config(); // load .env
 
@@ -34,7 +35,7 @@ const PORT = Number(process.env.PORT) || 4000;
 const CLIENT_URL = process.env.CLIENT_URL || "http://localhost:3000";
 const REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
 const JWT_SECRET = process.env.JWT_SECRET || "aryanseth";
-const USD_INR = Number(process.env.USD_INR) || 86;
+// USD_INR is now fetched dynamically – see src/utils/exchangeRate.ts
 const ENVMODE = process.env.NODE_ENV || "DEVELOPMENT";
 
 console.log(`Starting relay in ${ENVMODE} mode...`);
@@ -109,15 +110,16 @@ setInterval(() => logTop50FromRedis().catch(console.error), 60 * 1000);
 
 //// normalize incoming ticker data
 function normaliseTicker(t: any): Row {
+  const rate = getUsdInrRate();
   const priceUsd = +t.c;
   const changeUsd = +t.p;
   return {
     stockName: `${t.s.toLowerCase()}`,
     stocksymbol: t.s,
     stockPrice: priceUsd,
-    stockPriceINR: +(priceUsd * USD_INR).toFixed(2),
+    stockPriceINR: +(priceUsd * rate).toFixed(2),
     stockChange: changeUsd,
-    stockChangeINR: +(changeUsd * USD_INR).toFixed(2),
+    stockChangeINR: +(changeUsd * rate).toFixed(2),
     stockChangePercentage: +t.P,
     ts: new Date().toLocaleTimeString(),
   };
@@ -363,8 +365,13 @@ function ping() {
   });
 }
 
-setInterval(ping, 12000);
+setInterval(ping, 720000);
 
-server.listen(PORT, () => {
-  console.log(`Relay ready on http://localhost:${PORT}  •  ₹ rate=${USD_INR}`);
+// Seed exchange rate, then start listening
+initExchangeRate().then(() => {
+  server.listen(PORT, () => {
+    console.log(
+      `Relay ready on http://localhost:${PORT}  •  ₹ rate=${getUsdInrRate()}`,
+    );
+  });
 });
