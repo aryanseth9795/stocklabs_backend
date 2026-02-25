@@ -9,7 +9,8 @@ import {
   getMyOrders,
   getMyTransactions,
   logout,
-  forgetPassword,
+  requestPasswordReset,
+  resetPasswordWithOtp,
   refreshToken,
   updateProfile,
   getProfitLoss,
@@ -22,7 +23,8 @@ const router = express.Router();
 router.route("/signup").post(CreateUser);
 router.route("/login").post(LoginUser);
 router.route("/check").get(check);
-router.route("/forget").post(forgetPassword);
+router.route("/forget").post(requestPasswordReset); // Step 1: send OTP
+router.route("/forget/verify").post(resetPasswordWithOtp); // Step 2: verify OTP + new password
 router.route("/refresh").post(refreshToken);
 
 // Apply authentication middleware

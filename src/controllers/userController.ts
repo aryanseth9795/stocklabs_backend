@@ -10,6 +10,10 @@ import {
 } from "../utils/token.js";
 import { TradeRequestBody } from "../interface/userInterface.js";
 import { Prisma } from "@prisma/client";
+import { sendWelcomeEmail, sendOtpEmail } from "../utils/mailer.js";
+
+// In-memory OTP store: email → { otp, expiresAt }
+const otpStore = new Map<string, { otp: string; expiresAt: number }>();
 
 // Starting of Controller
 
@@ -62,6 +66,9 @@ export const CreateUser = TryCatch(
     const token = generateToken(result.id);
     const { accessToken, refreshToken } = generateTokenPair(result.id);
     console.log(result);
+
+    // Fire-and-forget welcome email (non-blocking)
+    sendWelcomeEmail(result.email, result.name).catch(() => {});
 
     // Set cookie for web clients, return tokens for mobile
     res.status(200).cookie("token", token, cookieOptions).json({
@@ -475,21 +482,81 @@ export const check = TryCatch(
   },
 );
 
-export const forgetPassword = TryCatch(
+/**
+ * Step 1 – Request password reset: generates a 6-digit OTP and emails it.
+ */
+export const requestPasswordReset = TryCatch(
   async (req: Request, res: Response, next: NextFunction) => {
-    const { email, password } = req.body;
+    const { email } = req.body;
+    if (!email) return next(new ErrorHandler("Email is required", 400));
+
     const user = await prisma.user.findUnique({ where: { email } });
+    // Always respond generically so we don't reveal whether email exists
     if (!user) {
-      return next(new ErrorHandler("User not found", 404));
+      return res.status(200).json({
+        success: true,
+        message: "If that email exists, an OTP has been sent.",
+      });
     }
-    user.password = await bcrypt.hash(password, 10);
-    await prisma.user.update({
-      where: { email },
-      data: { password: user.password },
-    });
+
+    const otp = String(Math.floor(100000 + Math.random() * 900000));
+    const expiresAt = Date.now() + 10 * 60 * 1000; // 10 minutes
+    otpStore.set(email, { otp, expiresAt });
+
+    await sendOtpEmail(email, otp);
+
     res.status(200).json({
       success: true,
-      message: "Password reset successfully ",
+      message: "OTP sent to your email. Valid for 10 minutes.",
+    });
+  },
+);
+
+/**
+ * Step 2 – Reset password: validates OTP and updates password.
+ */
+export const resetPasswordWithOtp = TryCatch(
+  async (req: Request, res: Response, next: NextFunction) => {
+    const { email, otp, newPassword } = req.body;
+    if (!email || !otp || !newPassword)
+      return next(
+        new ErrorHandler("email, otp and newPassword are required", 400),
+      );
+
+    if (newPassword.length < 6)
+      return next(
+        new ErrorHandler("Password must be at least 6 characters", 400),
+      );
+
+    const record = otpStore.get(email);
+    if (!record)
+      return next(
+        new ErrorHandler(
+          "No OTP found for this email. Please request a new one.",
+          400,
+        ),
+      );
+
+    if (Date.now() > record.expiresAt) {
+      otpStore.delete(email);
+      return next(
+        new ErrorHandler("OTP has expired. Please request a new one.", 400),
+      );
+    }
+
+    if (record.otp !== otp) return next(new ErrorHandler("Invalid OTP.", 400));
+
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+    await prisma.user.update({
+      where: { email },
+      data: { password: hashedPassword },
+    });
+
+    otpStore.delete(email); // OTP consumed
+
+    res.status(200).json({
+      success: true,
+      message: "Password reset successfully.",
     });
   },
 );

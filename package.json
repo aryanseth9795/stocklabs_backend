@@ -25,6 +25,7 @@
     "jsonwebtoken": "^9.0.2",
     "mongoose": "^8.12.1",
     "node-cron": "^4.2.1",
+    "resend": "^6.9.2",
     "socket.io": "^4.8.1",
     "ws": "^8.18.3"
   },

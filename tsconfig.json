@@ -107,9 +107,10 @@
   },
    "include": [
     "app.ts",
-   "prisma/**/*.ts",
-   "src/**/*",
-    "src/types/**/*.d.ts"
+    "prisma/**/*.ts",
+    "src/**/*",
+    "src/types/**/*.d.ts",
+    "scripts/**/*"
   ]
 //  "ts-node": { "esm": true } 
 }
