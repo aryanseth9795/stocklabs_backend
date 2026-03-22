@@ -80,7 +80,10 @@ app.use(errorMiddleware);
 const server = createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: [CLIENT_URL, "https://stocklabs.aryantechie.in"],
+    origin: function(origin, callback) {
+      // Allow all origins (including mobile apps without an origin)
+      callback(null, true);
+    },
     credentials: true,
   },
 });
@@ -127,18 +130,61 @@ function normaliseTicker(t: any): Row {
 
 const liveUpstream = new Set<string>(BOARD);
 
-const upstream = new WebSocket(
-  `wss://fstream.binance.com/stream?streams=${BOARD_STREAM}`,
-);
-upstream.on("message", async (buf) => {
-  const { data } = JSON.parse(buf.toString());
-  const row = normaliseTicker(data);
-  await rCmd
-    .pipeline()
-    .set(`tick:${row.stockName}`, JSON.stringify(row))
-    .publish(`tick.${row.stockName}`, JSON.stringify(row))
-    .exec();
-});
+let upstream: WebSocket | null = null;
+let reconnectTimer: NodeJS.Timeout | null = null;
+
+function connectBinanceUpstream() {
+  if (upstream) {
+    upstream.terminate();
+  }
+
+  console.log("[Binance WS] Connecting upstream...");
+  upstream = new WebSocket(`wss://fstream.binance.com/stream?streams=${BOARD_STREAM}`);
+
+  upstream.on("open", () => {
+    console.log("[Binance WS] Connected upstream");
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+  });
+
+  upstream.on("message", async (buf) => {
+    try {
+      const parsed = JSON.parse(buf.toString());
+      if (!parsed.data) return;
+      const row = normaliseTicker(parsed.data);
+      await rCmd
+        .pipeline()
+        .set(`tick:${row.stockName}`, JSON.stringify(row))
+        .publish(`tick.${row.stockName}`, JSON.stringify(row))
+        .exec();
+    } catch (err) {
+      console.error("[Binance WS] message processing error:", err);
+    }
+  });
+
+  upstream.on("close", () => {
+    console.warn("[Binance WS] Connection closed. Reconnecting in 5s...");
+    scheduleReconnect();
+  });
+
+  upstream.on("error", (err) => {
+    console.error(`[Binance WS] Error: ${(err as Error).message}`);
+    upstream?.terminate();
+  });
+}
+
+function scheduleReconnect() {
+  if (!reconnectTimer) {
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      connectBinanceUpstream();
+    }, 5000);
+  }
+}
+
+connectBinanceUpstream();
 
 //// Redis → Socket.IO
 rSub.psubscribe("tick.*");
