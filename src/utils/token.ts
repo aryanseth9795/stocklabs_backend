@@ -1,7 +1,12 @@
 import jwt from "jsonwebtoken";
+import { env } from "../config/env.js";
 
-const accessSecret = process.env.JWT_SECRET || "aryanseth";
-const refreshSecret = process.env.JWT_REFRESH_SECRET || "aryanseth_refresh";
+// Secrets come from the validated env module — never from a hardcoded fallback.
+// See review S-01: reading process.env directly here resolved to `undefined` and
+// silently fell back to a literal in source, because ESM evaluates this module
+// before app.ts calls dotenv's config().
+const accessSecret = env.JWT_SECRET;
+const refreshSecret = env.JWT_REFRESH_SECRET;
 
 // Access token: short-lived (15 minutes)
 export const generateAccessToken = (userId: string): string => {
@@ -59,9 +64,14 @@ export const verifyRefreshToken = (
   }
 };
 
-// Legacy function for backward compatibility with existing cookie-based auth
+/**
+ * Long-lived token stored in the web client's httpOnly cookie (30 days).
+ * Carries `type: "access"` so it verifies through the same path as mobile bearer
+ * tokens. It previously omitted the claim, which made verifyAccessToken reject it
+ * and forced a legacy fallback branch that verified against a different secret.
+ */
 export const generateToken = (userId: string): string => {
-  return jwt.sign({ userId }, accessSecret, {
+  return jwt.sign({ userId, type: "access" }, accessSecret, {
     expiresIn: "30d",
   });
 };

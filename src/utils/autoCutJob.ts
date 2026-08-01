@@ -1,26 +1,11 @@
 import cron from "node-cron";
 import prisma from "../db/db.js";
+import { getLivePriceINR, type AssetType } from "../utils/priceCache.js";
 
-// boardCache is exported from app.ts – imported here for live prices
-// We use a dynamic import so this file can be loaded before app.ts sets up
-
-let _boardCache: Record<string, { stockPrice: number; stockPriceINR: number }> =
-  {};
-
-/**
- * Called from app.ts to give the CRON job access to the live board cache.
- */
-export function setBoardCacheRef(
-  cache: Record<string, { stockPrice: number; stockPriceINR: number }>,
-) {
-  _boardCache = cache;
-}
-
-/**
- * Also store commodity prices (updated by SSE relay in app.ts).
- * Shape: { GOLD: 161668, SILVER: 265350, ... }
- */
-export const commodityPriceCache: Record<string, number> = {};
+// Prices come from src/utils/priceCache.ts, which owns both the crypto board and
+// the commodity cache. That module exists so app.ts and the controllers can
+// share one price source without an import cycle — it replaces the
+// setBoardCacheRef() back-reference this file used to need.
 
 async function runAutoCut() {
   console.log("[AutoCut] Starting midnight auto-cut job…");
@@ -40,16 +25,10 @@ async function runAutoCut() {
 
   for (const pos of openPositions) {
     try {
-      let currentPrice: number | null = null;
-
-      if (pos.assetType === "commodity") {
-        currentPrice = commodityPriceCache[pos.stockSymbol] ?? null;
-      } else {
-        // Crypto – check boardCache (in-memory) for the INR price
-        const sym = pos.stockSymbol.toUpperCase();
-        const entry = _boardCache[sym];
-        if (entry) currentPrice = entry.stockPriceINR ?? entry.stockPrice;
-      }
+      const currentPrice = getLivePriceINR(
+        pos.stockSymbol,
+        pos.assetType as AssetType,
+      );
 
       if (currentPrice === null) {
         console.warn(
@@ -63,6 +42,26 @@ async function runAutoCut() {
       const returnAmount = pos.totalValue + profitLoss;
 
       await prisma.$transaction(async (tx) => {
+        // Claim the position first, conditionally. Without this, a user
+        // covering manually at the same moment this job runs is credited twice
+        // for one position (S-06). If the row is no longer open, someone else
+        // got there first and we must not touch the balance.
+        const claimed = await tx.shortPosition.updateMany({
+          where: { id: pos.id, status: "open" },
+          data: {
+            status: "auto_cut",
+            exitPrice,
+            profitLoss,
+            closedAt: new Date(),
+          },
+        });
+        if (claimed.count === 0) {
+          console.log(
+            `[AutoCut] Position ${pos.id} was already closed, skipping.`,
+          );
+          return;
+        }
+
         const user = await tx.user.findUnique({ where: { id: pos.userId } });
         if (!user) throw new Error(`User ${pos.userId} not found`);
 
@@ -72,16 +71,6 @@ async function runAutoCut() {
         await tx.user.update({
           where: { id: pos.userId },
           data: { balance: closingBalance },
-        });
-
-        await tx.shortPosition.update({
-          where: { id: pos.id },
-          data: {
-            status: "auto_cut",
-            exitPrice,
-            profitLoss,
-            closedAt: new Date(),
-          },
         });
 
         const txRecord = await tx.transaction.create({
@@ -128,8 +117,11 @@ async function runAutoCut() {
  * Schedule: every day at 18:30 UTC = 00:00 IST
  */
 export function startAutoCutJob() {
-  // "30 18 * * *" = 18:30 UTC = 00:00 IST
-  cron.schedule("30 18 * * *", runAutoCut, {
+  // Midnight expressed directly in the target timezone — node-cron does the
+  // conversion. The old expression was "30 18 * * *", correct for UTC, but it
+  // was ALSO passed timezone: "Asia/Kolkata", so it fired at 18:30 IST and
+  // force-closed every open short in the middle of the trading day (S-07).
+  cron.schedule("0 0 * * *", runAutoCut, {
     timezone: "Asia/Kolkata",
   });
   console.log(

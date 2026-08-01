@@ -3,39 +3,55 @@ import prisma from "../db/db.js";
 import TryCatch from "../utils/Trycatch.js";
 import ErrorHandler from "../middlewares/ErrorHandler.js";
 import { Prisma } from "@prisma/client";
+import { getLivePriceINR, type AssetType } from "../utils/priceCache.js";
+import {
+  validateQuantity,
+  validateString,
+  validateEnum,
+} from "../utils/validate.js";
 
 // ─── Short Sell ───────────────────────────────────────────────────────────────
 // Opens a short position: hold margin = entryPrice * qty from user balance,
 // create ShortPosition(status=open), Transaction, and Order records.
 export const executeShortSell = TryCatch(
   async (req: Request, res: Response, next: NextFunction) => {
-    const {
-      stockName,
-      stockSymbol,
-      quantity,
-      rate,
-      assetType = "crypto",
-    } = req.body;
     const userId = req.user?.id;
 
     if (!userId)
       return next(
         new ErrorHandler("Please login to access this resource", 401),
       );
-    if (!stockName || !stockSymbol || !quantity || !rate)
-      return next(new ErrorHandler("Please provide all required fields", 400));
-    if (quantity <= 0 || rate <= 0)
-      return next(new ErrorHandler("Quantity and rate must be positive", 400));
+
+    const stockName = validateString(req.body.stockName, "stockName");
+    const stockSymbol = validateString(req.body.stockSymbol, "stockSymbol");
+    const quantity = validateQuantity(req.body.quantity);
+    const assetType = validateEnum(
+      req.body.assetType ?? "crypto",
+      ["crypto", "commodity"] as const,
+      "assetType",
+    ) as AssetType;
+
+    // Entry price is the server's, not the client's. A client-chosen entry price
+    // lets a user open a short at any level they like (S-02).
+    const rate = getLivePriceINR(stockSymbol, assetType);
+    if (rate === null)
+      return next(
+        new ErrorHandler(
+          `No live price available for ${stockSymbol}. Please try again shortly.`,
+          503,
+        ),
+      );
 
     const margin = quantity * rate;
 
     const result = await prisma.$transaction(
       async (tx: Prisma.TransactionClient) => {
         const user = await tx.user.findUnique({ where: { id: userId } });
-        if (!user) throw new Error("User not found");
+        if (!user) throw new ErrorHandler("User not found", 404);
         if (user.balance < margin)
-          throw new Error(
+          throw new ErrorHandler(
             `Insufficient balance. Required margin: ₹${margin.toFixed(2)}`,
+            400,
           );
 
         const openingBalance = user.balance;
@@ -98,6 +114,7 @@ export const executeShortSell = TryCatch(
       success: true,
       message: "Short position opened successfully",
       shortPosition: result.shortPosition,
+      executedPrice: rate,
     });
   },
 );
@@ -107,33 +124,64 @@ export const executeShortSell = TryCatch(
 // return margin ± P&L to user balance.
 export const closeShortPosition = TryCatch(
   async (req: Request, res: Response, next: NextFunction) => {
-    const { shortPositionId, rate } = req.body;
     const userId = req.user?.id;
 
     if (!userId)
       return next(
         new ErrorHandler("Please login to access this resource", 401),
       );
-    if (!shortPositionId || rate === undefined)
-      return next(
-        new ErrorHandler("shortPositionId and rate are required", 400),
-      );
+
+    const shortPositionId = validateString(
+      req.body.shortPositionId,
+      "shortPositionId",
+    );
 
     const result = await prisma.$transaction(
       async (tx: Prisma.TransactionClient) => {
         const short = await tx.shortPosition.findUnique({
           where: { id: shortPositionId },
         });
-        if (!short) throw new Error("Short position not found");
-        if (short.userId !== userId) throw new Error("Unauthorized");
-        if (short.status !== "open") throw new Error("Position already closed");
+        if (!short) throw new ErrorHandler("Short position not found", 404);
+        if (short.userId !== userId) throw new ErrorHandler("Unauthorized", 403);
+        if (short.status !== "open")
+          throw new ErrorHandler("Position already closed", 409);
 
-        const exitPrice = rate;
+        // Exit price from the server. This one mattered most: P&L is
+        // (entryPrice - exitPrice) * quantity, so a client-supplied exit price
+        // was a direct dial on how much money to create (S-02).
+        const exitPrice = getLivePriceINR(
+          short.stockSymbol,
+          short.assetType as AssetType,
+        );
+        if (exitPrice === null)
+          throw new ErrorHandler(
+            `No live price available for ${short.stockSymbol}. Please try again shortly.`,
+            503,
+          );
+
         const profitLoss = (short.entryPrice - exitPrice) * short.quantity;
         const returnAmount = short.totalValue + profitLoss; // margin ± P&L
 
+        // Claim the position with a conditional write. The status check above is
+        // a plain read under READ COMMITTED, so two concurrent covers (or a cover
+        // racing the auto-cut job) both saw "open" and both credited the balance —
+        // the position closes once but pays out twice (S-06). Only one
+        // transaction can move the row out of "open"; the loser aborts here,
+        // before any money moves.
+        const claimed = await tx.shortPosition.updateMany({
+          where: { id: shortPositionId, status: "open" },
+          data: {
+            status: "closed",
+            exitPrice,
+            profitLoss,
+            closedAt: new Date(),
+          },
+        });
+        if (claimed.count === 0)
+          throw new ErrorHandler("Position already closed", 409);
+
         const user = await tx.user.findUnique({ where: { id: userId } });
-        if (!user) throw new Error("User not found");
+        if (!user) throw new ErrorHandler("User not found", 404);
 
         const openingBalance = user.balance;
         const closingBalance = openingBalance + returnAmount;
@@ -144,15 +192,8 @@ export const closeShortPosition = TryCatch(
           data: { balance: closingBalance },
         });
 
-        // Update ShortPosition
-        const closedShort = await tx.shortPosition.update({
+        const closedShort = await tx.shortPosition.findUnique({
           where: { id: shortPositionId },
-          data: {
-            status: "closed",
-            exitPrice,
-            profitLoss,
-            closedAt: new Date(),
-          },
         });
 
         // Transaction record
@@ -184,7 +225,7 @@ export const closeShortPosition = TryCatch(
           },
         });
 
-        return { closedShort, profitLoss, returnAmount };
+        return { closedShort, profitLoss, returnAmount, exitPrice };
       },
     );
 
@@ -196,6 +237,7 @@ export const closeShortPosition = TryCatch(
           : `Position closed with loss ₹${Math.abs(result.profitLoss).toFixed(2)}`,
       profitLoss: result.profitLoss,
       shortPosition: result.closedShort,
+      executedPrice: result.exitPrice,
     });
   },
 );
@@ -211,8 +253,13 @@ export const getShortPositions = TryCatch(
 
     const { status } = req.query;
 
-    const whereClause: any = { userId };
-    if (status) whereClause.status = status as string;
+    const whereClause: Prisma.ShortPositionWhereInput = { userId };
+    if (status)
+      whereClause.status = validateEnum(
+        status,
+        ["open", "closed", "auto_cut"] as const,
+        "status",
+      );
 
     const positions = await prisma.shortPosition.findMany({
       where: whereClause,
