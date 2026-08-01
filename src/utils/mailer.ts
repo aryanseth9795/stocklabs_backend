@@ -1,6 +1,10 @@
 import { Resend } from "resend";
+import { env } from "../config/env.js";
 
-const resend = new Resend(process.env.RESEND_API_KEY);
+// Key comes from the validated env module. Reading process.env directly here
+// resolved to `undefined` under ESM evaluation order, so every email silently
+// failed inside the try/catch below — see review S-01.
+const resend = env.RESEND_API_KEY ? new Resend(env.RESEND_API_KEY) : null;
 
 const FROM = "noreply@aryantechie.in";
 
@@ -9,6 +13,7 @@ export async function sendWelcomeEmail(
   to: string,
   name: string,
 ): Promise<void> {
+  if (!resend) return;
   try {
     await resend.emails.send({
       from: FROM,
@@ -49,7 +54,14 @@ export async function sendWelcomeEmail(
 }
 
 // ─── OTP Email ─────────────────────────────────────────────────────────────────
+/**
+ * Unlike the welcome email, a failure here is surfaced to the caller: if the OTP
+ * never leaves the building, telling the user "check your inbox" strands them.
+ */
 export async function sendOtpEmail(to: string, otp: string): Promise<void> {
+  if (!resend) {
+    throw new Error("Email delivery is not configured (RESEND_API_KEY missing)");
+  }
   try {
     await resend.emails.send({
       from: FROM,
@@ -83,5 +95,6 @@ export async function sendOtpEmail(to: string, otp: string): Promise<void> {
     });
   } catch (err) {
     console.error("[Mailer] sendOtpEmail failed:", err);
+    throw new Error("Failed to send OTP email");
   }
 }

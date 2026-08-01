@@ -3,12 +3,9 @@ import prisma from "../db/db.js";
 import TryCatch from "../utils/Trycatch.js";
 import ErrorHandler from "../middlewares/ErrorHandler.js";
 import { Prisma } from "@prisma/client";
-import { commodityPriceCache } from "../utils/autoCutJob.js";
-import https from "https";
-import http from "http";
-
-const COMMODITY_SSE_URL =
-  "https://ssj-server-om8r.onrender.com/api/prices/stream";
+import { getLivePriceINR } from "../utils/priceCache.js";
+import { validateQuantity, validateEnum } from "../utils/validate.js";
+import { addSubscriber } from "../utils/commodityFeed.js";
 
 const COMMODITY_NAMES: Record<string, string> = {
   GOLD: "Gold",
@@ -20,9 +17,14 @@ const COMMODITY_NAMES: Record<string, string> = {
 // ─── SSE Relay ────────────────────────────────────────────────────────────────
 /**
  * GET /commodity/stream
- * Proxies the upstream commodity SSE to the client.
- * Handles upstream cold-start timeouts by retrying every 10 s,
- * and sends keepalive comments every 20 s so the client doesn't time out.
+ *
+ * Fans out the server's single upstream price feed to this client.
+ *
+ * This used to open its own upstream connection per request, which meant N
+ * clients produced N connections to the third-party service — and, more
+ * seriously, that the server only knew commodity prices while somebody happened
+ * to be watching. The feed now runs from boot in src/utils/commodityFeed.ts and
+ * this handler just subscribes to it (review A-01).
  */
 export const streamCommodityPrices = (
   req: Request,
@@ -35,146 +37,62 @@ export const streamCommodityPrices = (
   res.setHeader("X-Accel-Buffering", "no"); // Disable nginx buffering
   res.flushHeaders();
 
-  let closed = false;
-  let upstreamReq: http.ClientRequest | null = null;
-  let retryTimer: ReturnType<typeof setTimeout> | null = null;
-  let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  const unsubscribe = addSubscriber(res);
 
-  const cleanup = () => {
-    closed = true;
-    if (retryTimer) clearTimeout(retryTimer);
-    if (heartbeatTimer) clearInterval(heartbeatTimer);
-    upstreamReq?.destroy();
-  };
-
-  // Keepalive comment every 20s so client knows we're alive
-  heartbeatTimer = setInterval(() => {
-    if (!closed) {
-      try {
-        res.write(": keepalive\n\n");
-      } catch {
-        cleanup();
-      }
+  // Keepalive so intermediaries don't drop an idle connection.
+  const heartbeat = setInterval(() => {
+    try {
+      res.write(": keepalive\n\n");
+    } catch {
+      cleanup();
     }
   }, 20_000);
 
-  const connect = () => {
-    if (closed) return;
+  let cleanedUp = false;
+  function cleanup() {
+    if (cleanedUp) return;
+    cleanedUp = true;
+    clearInterval(heartbeat);
+    unsubscribe();
+  }
 
-    const url = new URL(COMMODITY_SSE_URL);
-    const lib = url.protocol === "https:" ? https : http;
-
-    upstreamReq = lib.get(
-      {
-        hostname: url.hostname,
-        path: url.pathname + url.search,
-        headers: { Accept: "text/event-stream" },
-        timeout: 30_000, // 30s socket timeout
-      },
-      (upstreamRes) => {
-        if (closed) {
-          upstreamRes.destroy();
-          return;
-        }
-
-        let buffer = "";
-
-        upstreamRes.on("data", (chunk: Buffer) => {
-          if (closed) return;
-          const text = chunk.toString();
-          buffer += text;
-
-          // Parse SSE events from buffer to update price cache
-          const lines = buffer.split("\n");
-          buffer = lines.pop() ?? "";
-
-          let eventType = "";
-          let dataStr = "";
-          for (const line of lines) {
-            if (line.startsWith("event:")) {
-              eventType = line.slice(6).trim();
-            } else if (line.startsWith("data:")) {
-              dataStr += line.slice(5).trim();
-            } else if (line === "" && dataStr) {
-              if (eventType === "prices:update") {
-                try {
-                  const payload = JSON.parse(dataStr);
-                  const list = payload?.live?.list;
-                  if (Array.isArray(list)) {
-                    list.forEach((item: any) => {
-                      const price = parseFloat(item.lastPrice);
-                      if (!isNaN(price)) {
-                        commodityPriceCache[item.symbol] = price;
-                      }
-                    });
-                  }
-                } catch {
-                  /* ignore */
-                }
-              }
-              eventType = "";
-              dataStr = "";
-            }
-          }
-
-          // Forward raw chunk directly to client
-          try {
-            res.write(text);
-          } catch {
-            cleanup();
-          }
-        });
-
-        upstreamRes.on("end", () => {
-          if (!closed) {
-            console.warn("[Commodity SSE] Upstream ended, retrying in 10s…");
-            retryTimer = setTimeout(connect, 10_000);
-          }
-        });
-
-        upstreamRes.on("error", (err) => {
-          console.error("[Commodity SSE] Upstream stream error:", err.message);
-          if (!closed) {
-            retryTimer = setTimeout(connect, 10_000);
-          }
-        });
-      },
-    );
-
-    upstreamReq.on("timeout", () => {
-      console.warn("[Commodity SSE] Upstream request timed out, retrying…");
-      upstreamReq?.destroy();
-      if (!closed) {
-        retryTimer = setTimeout(connect, 10_000);
-      }
-    });
-
-    upstreamReq.on("error", (err) => {
-      console.error("[Commodity SSE] Request error:", err.message);
-      if (!closed) {
-        retryTimer = setTimeout(connect, 10_000);
-      }
-    });
-  };
-
-  // Disconnect handling
   req.on("close", cleanup);
   res.on("close", cleanup);
-
-  connect();
 };
 
 // ─── Execute Commodity Order ──────────────────────────────────────────────────
 export const executeCommodityOrder = TryCatch(
   async (req: Request, res: Response, next: NextFunction) => {
-    const { symbol, quantity, rate, type } = req.body;
     const userId = req.user?.id;
     if (!userId)
       return next(
         new ErrorHandler("Please login to access this resource", 401),
       );
-    if (!symbol || !quantity || !rate || !type)
-      return next(new ErrorHandler("Please provide all required fields", 400));
+
+    // `type` is validated against an allow-list. The control flow below ends in
+    // an `else` that executes a SELL, so any unrecognised value — "SELL", a
+    // typo, anything crafted — used to silently sell the user's holding (S-12).
+    const type = validateEnum(
+      req.body.type,
+      ["buy", "sell", "short_sell"] as const,
+      "type",
+    );
+    const symbol = validateEnum(
+      req.body.symbol,
+      Object.keys(COMMODITY_NAMES) as (keyof typeof COMMODITY_NAMES)[],
+      "symbol",
+    );
+    const quantity = validateQuantity(req.body.quantity);
+
+    // Server-authoritative price (S-02).
+    const rate = getLivePriceINR(symbol, "commodity");
+    if (rate === null)
+      return next(
+        new ErrorHandler(
+          `No live price available for ${symbol}. Please try again shortly.`,
+          503,
+        ),
+      );
 
     const name = COMMODITY_NAMES[symbol] ?? symbol;
     const cost = quantity * rate;
@@ -183,10 +101,11 @@ export const executeCommodityOrder = TryCatch(
       const result = await prisma.$transaction(
         async (tx: Prisma.TransactionClient) => {
           const user = await tx.user.findUnique({ where: { id: userId } });
-          if (!user) throw new Error("User not found");
+          if (!user) throw new ErrorHandler("User not found", 404);
           if (user.balance < cost)
-            throw new Error(
+            throw new ErrorHandler(
               `Insufficient balance. Required margin: ₹${cost.toFixed(2)}`,
+              400,
             );
 
           const openingBalance = user.balance;
@@ -245,6 +164,7 @@ export const executeCommodityOrder = TryCatch(
         success: true,
         message: "Commodity short position opened successfully",
         shortPosition: result,
+        executedPrice: rate,
       });
     }
 
@@ -252,14 +172,15 @@ export const executeCommodityOrder = TryCatch(
     const result = await prisma.$transaction(
       async (tx: Prisma.TransactionClient) => {
         const user = await tx.user.findUnique({ where: { id: userId } });
-        if (!user) throw new Error("User not found");
+        if (!user) throw new ErrorHandler("User not found", 404);
 
         const openingBalance = user.balance;
 
         if (type === "buy") {
           if (user.balance < cost)
-            throw new Error(
+            throw new ErrorHandler(
               `Insufficient balance. Required: ₹${cost.toFixed(2)}`,
+              400,
             );
 
           const closingBalance = openingBalance - cost;
@@ -330,7 +251,7 @@ export const executeCommodityOrder = TryCatch(
           });
 
           if (!holding || holding.quantity < quantity)
-            throw new Error("Insufficient commodity holdings to sell");
+            throw new ErrorHandler("Insufficient commodity holdings to sell", 400);
 
           const saleAmount = cost;
           const closingBalance = openingBalance + saleAmount;
@@ -346,9 +267,16 @@ export const executeCommodityOrder = TryCatch(
               where: { userId_symbol: { userId, symbol } },
             });
           } else {
+            // `total` is COST BASIS, so remove it at the average price paid —
+            // not at the sale price. Subtracting `cost` (the proceeds) meant
+            // selling into a rising market drove the basis negative and
+            // poisoned the average price on the next buy (S-11).
             await tx.commodityPortfolio.update({
               where: { userId_symbol: { userId, symbol } },
-              data: { quantity: newQty, total: holding.total - cost },
+              data: {
+                quantity: newQty,
+                total: holding.total - holding.price * quantity,
+              },
             });
           }
 
@@ -388,6 +316,7 @@ export const executeCommodityOrder = TryCatch(
       success: true,
       message: `Commodity ${type} order executed successfully`,
       ...result,
+      executedPrice: rate,
     });
   },
 );

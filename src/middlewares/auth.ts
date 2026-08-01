@@ -1,7 +1,5 @@
 import { Request, Response, NextFunction } from "express";
 import ErrorHandler from "./ErrorHandler.js";
-import jwt from "jsonwebtoken";
-import { UserPayload } from "../interface/userInterface.js";
 import { verifyAccessToken } from "../utils/token.js";
 
 /**
@@ -31,31 +29,15 @@ const isAuthenticated = (
     return next(new ErrorHandler("Please login to access this resource", 401));
   }
 
-  // Try to verify with the new access token format first
+  // Cookie and bearer tokens now share one format and one secret, so a single
+  // verification path covers both. The previous legacy fallback verified against
+  // a different secret than the one used to sign — see review S-01.
   const decoded = verifyAccessToken(token);
-  if (decoded) {
-    req.user = { id: decoded.userId };
-    return next();
-  }
-
-  // Fall back to legacy token format (for existing cookie tokens)
-  let legacyDecoded: unknown;
-  try {
-    legacyDecoded = jwt.verify(token, process.env.JWT_SECRET!);
-  } catch {
+  if (!decoded) {
     return next(new ErrorHandler("Invalid or expired token", 401));
   }
 
-  if (
-    !legacyDecoded ||
-    typeof legacyDecoded === "string" ||
-    !(legacyDecoded as any).userId
-  ) {
-    return next(new ErrorHandler("Invalid token payload", 401));
-  }
-
-  const { userId } = legacyDecoded as UserPayload;
-  req.user = { id: userId };
+  req.user = { id: decoded.userId };
   return next();
 };
 

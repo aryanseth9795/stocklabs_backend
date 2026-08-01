@@ -1,44 +1,33 @@
 /**
- * Dynamic USD/INR exchange rate fetcher.
- * Uses the free open.er-api.com (no key required, 1 500 req/month).
- * Fetches once on startup, then refreshes every 24 hours.
- * Falls back to 86 if the API is unreachable.
+ * USD → INR conversion rate: a fixed constant.
+ *
+ * The platform is denominated in rupees end to end — balances, orders, short
+ * positions, and both clients. Binance quotes its pairs in USD, so this is the
+ * single point where that gets converted, and it is the only place the number
+ * should ever appear.
+ *
+ * Previously this fetched a live rate from open.er-api.com on startup and every
+ * 24 hours, falling back to 86 when unreachable. That made pricing depend on a
+ * third-party service and, worse, non-deterministic: the same trade could be
+ * priced differently across restarts, and a fetch failure silently shifted every
+ * price by ~10% (86 vs ~95). A paper-trading platform gains nothing from a
+ * live FX rate and loses reproducibility, so the rate is now pinned.
+ *
+ * NOTE: changing this value does NOT retroactively reprice existing holdings.
+ * Cost basis is stored in rupees at the rate that applied when the order filled,
+ * which is the correct accounting behaviour — historical fills do not move.
  */
 
-const FALLBACK_RATE = 86;
-const REFRESH_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
+/** Rupees per US dollar. */
+export const USD_INR_RATE = 95;
 
-let cachedRate: number = FALLBACK_RATE;
-
-async function fetchRate(): Promise<number> {
-  try {
-    const res = await fetch("https://open.er-api.com/v6/latest/USD");
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    const rate = data?.rates?.INR;
-    if (typeof rate === "number" && rate > 0) {
-      console.log(`[ExchangeRate] USD/INR = ${rate}`);
-      return rate;
-    }
-    throw new Error("INR rate missing from response");
-  } catch (err: any) {
-    console.warn(
-      `[ExchangeRate] Fetch failed, using fallback ${FALLBACK_RATE}:`,
-      err.message,
-    );
-    return FALLBACK_RATE;
-  }
-}
-
-/** Call once at server startup to seed the rate and start auto-refresh. */
-export async function initExchangeRate(): Promise<void> {
-  cachedRate = await fetchRate();
-  setInterval(async () => {
-    cachedRate = await fetchRate();
-  }, REFRESH_INTERVAL_MS);
-}
-
-/** Returns the latest cached USD → INR rate (never blocks). */
+/** Returns the USD → INR rate. Constant; never blocks, never fails. */
 export function getUsdInrRate(): number {
-  return cachedRate;
+  return USD_INR_RATE;
+}
+
+/** Converts a USD amount to rupees, rounded to paise. */
+export function usdToInr(usd: number): number {
+  if (!Number.isFinite(usd)) return 0;
+  return +(usd * USD_INR_RATE).toFixed(2);
 }

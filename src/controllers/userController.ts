@@ -11,21 +11,58 @@ import {
 import { TradeRequestBody } from "../interface/userInterface.js";
 import { Prisma } from "@prisma/client";
 import { sendWelcomeEmail, sendOtpEmail } from "../utils/mailer.js";
+import { env, isDevelopment } from "../config/env.js";
+import { getLivePriceINR } from "../utils/priceCache.js";
+import {
+  validateQuantity,
+  validateEnum,
+  validateString,
+  validateEmail,
+} from "../utils/validate.js";
+import crypto from "crypto";
 
-// In-memory OTP store: email → { otp, expiresAt }
-const otpStore = new Map<string, { otp: string; expiresAt: number }>();
+type OtpRecord = {
+  otp: string;
+  expiresAt: number;
+  issuedAt: number;
+  attempts: number;
+};
+
+/**
+ * In-memory OTP store: email → record.
+ *
+ * KNOWN LIMITATION (review D-3): this lives in process memory, so OTPs are lost
+ * on restart and are only verifiable on the instance that issued them. Behind a
+ * load balancer with N instances, roughly (N-1)/N of reset attempts fail. Move
+ * to Redis (already a dependency and connected) with a native TTL.
+ */
+const otpStore = new Map<string, OtpRecord>();
+
+const OTP_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const OTP_MAX_ATTEMPTS = 5;
+const OTP_RESEND_COOLDOWN_MS = 60 * 1000; // 1 minute
+
+/** Constant-time string comparison, so a wrong OTP can't be narrowed down by
+ *  timing. Length is compared first because timingSafeEqual requires equal
+ *  lengths — OTP length is fixed and not secret, so this leaks nothing. */
+function timingSafeEqualStr(a: string, b: string): boolean {
+  const bufA = Buffer.from(a, "utf8");
+  const bufB = Buffer.from(b, "utf8");
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}
 
 // Starting of Controller
 
-const cookie_Expiry: number = Number(process.env.COOKIE_EXPIRY) || 3;
-const MODE: string = String(process.env.NODE_ENV) || "PRODUCTION";
-
+// Read via the env module so dotenv has definitely run. Previously these were
+// module-level process.env reads that produced the string "undefined", which made
+// `MODE !== "DEVELOPMENT"` always true and forced secure/none cookies in local
+// development — the lax branch never ran once (S-20).
 const cookieOptions = {
-  maxAge: cookie_Expiry * 24 * 60 * 60 * 1000 || 3 * 24 * 60 * 60 * 1000,
+  maxAge: env.COOKIE_EXPIRY_DAYS * 24 * 60 * 60 * 1000,
   httpOnly: true,
-  secure: MODE !== "DEVELOPMENT",
-  sameSite: (MODE !== "DEVELOPMENT" ? "none" : "lax") as "none" | "lax",
-  // path: "/app/home",
+  secure: !isDevelopment,
+  sameSite: (isDevelopment ? "lax" : "none") as "lax" | "none",
 };
 
 export const CreateUser = TryCatch(
@@ -35,9 +72,10 @@ export const CreateUser = TryCatch(
     next: NextFunction,
   ) => {
     const { name, email, password } = req.body;
-    const existingUser = await prisma.user.findUnique({
-      where: { email },
-    });
+
+    // Validate BEFORE querying. The lookup used to run first, so a request
+    // without an email hit Prisma with `email: undefined` and returned a 500
+    // instead of the 400 the checks below were written to produce (S-18).
     if (!name || !email || !password) {
       return next(new ErrorHandler("Please provide all fields", 400));
     }
@@ -46,6 +84,14 @@ export const CreateUser = TryCatch(
         new ErrorHandler("Password must be at least 6 characters", 400),
       );
     }
+
+    // Normalise so "Aryan@x.com" and "aryan@x.com" are one account, not two.
+    const normalisedEmail = validateEmail(email);
+    const trimmedName = validateString(name, "name");
+
+    const existingUser = await prisma.user.findUnique({
+      where: { email: normalisedEmail },
+    });
     if (existingUser) {
       return next(new ErrorHandler("User Already Exists", 400));
     }
@@ -55,23 +101,22 @@ export const CreateUser = TryCatch(
       return next(new ErrorHandler("Error in hashing password", 400));
     }
     const result = await prisma.user.create({
-      data: { name, email, password: hashedPassword },
+      data: {
+        name: trimmedName,
+        email: normalisedEmail,
+        password: hashedPassword,
+      },
     });
-
-    if (!result) {
-      next(new ErrorHandler("Error in creating User", 400));
-    }
 
     //sending tokens
     const token = generateToken(result.id);
     const { accessToken, refreshToken } = generateTokenPair(result.id);
-    console.log(result);
 
     // Fire-and-forget welcome email (non-blocking)
     sendWelcomeEmail(result.email, result.name).catch(() => {});
 
     // Set cookie for web clients, return tokens for mobile
-    res.status(200).cookie("token", token, cookieOptions).json({
+    res.status(201).cookie("token", token, cookieOptions).json({
       success: true,
       message: "Account Created Successfully",
       accessToken,
@@ -84,24 +129,28 @@ export const LoginUser = TryCatch(
   async (req: Request, res: Response, next: NextFunction) => {
     const { email, password } = req.body;
 
-    const result = await prisma.user.findUnique({
-      where: { email },
-    });
+    // Validate before querying, and normalise identically to signup so an
+    // account created as "Aryan@x.com" can be logged into as "aryan@x.com".
     if (!email || !password) {
       return next(new ErrorHandler("Please provide all fields", 400));
     }
+    const normalisedEmail = String(email).trim().toLowerCase();
+
+    const result = await prisma.user.findUnique({
+      where: { email: normalisedEmail },
+    });
     if (!result) {
       return next(new ErrorHandler("Invalid Email or Password", 400));
     }
 
-    const isPasswordMatched = await bcrypt.compare(password, result?.password);
+    const isPasswordMatched = await bcrypt.compare(password, result.password);
 
     if (!isPasswordMatched) {
       return next(new ErrorHandler("Invalid Email or Password", 400));
     }
     //sending tokens
-    const token = generateToken(result?.id!);
-    const { accessToken, refreshToken } = generateTokenPair(result?.id!);
+    const token = generateToken(result.id);
+    const { accessToken, refreshToken } = generateTokenPair(result.id);
 
     // Set cookie for web clients, return tokens for mobile
     res.status(200).cookie("token", token, cookieOptions).json({
@@ -115,12 +164,16 @@ export const LoginUser = TryCatch(
 
 export const getMyProfile = TryCatch(
   async (req: Request, res: Response, next: NextFunction) => {
-    // Check if user is authenticated o
+    // `return` matters: without it execution continued into a query with
+    // `id: undefined`, and the error middleware fired a second time on an
+    // already-sent response (S-17).
     if (!req?.user?.id) {
-      next(new ErrorHandler("Please login to access this resource", 401));
+      return next(
+        new ErrorHandler("Please login to access this resource", 401),
+      );
     }
 
-    const user = await prisma.user.findUnique({ where: { id: req?.user?.id } });
+    const user = await prisma.user.findUnique({ where: { id: req.user.id } });
     if (!user) {
       return next(new ErrorHandler("User Not Found", 404));
     }
@@ -154,155 +207,54 @@ export const getMyProfile = TryCatch(
   },
 );
 
-// export const ExecuteOrder = TryCatch(
-//   async (req: Request, res: Response, next: NextFunction) => {
-//     const {
-//       type,
-//       stockSymbol,
-//       stockName,
-//       stockQuantity,
-//       stockPrice,
-
-//     } = req.body;
-
-//     if (!stockName || !stockQuantity || !stockPrice || !stockSymbol || !type) {
-//       return next(new ErrorHandler("Please provide all fields", 400));
-//     }
-//     const user = await prisma.user.findUnique({
-//       where: { id: req.user!.id },
-//     });
-//     if (stockPrice * stockQuantity > user?.balance!) {
-//       return next(new ErrorHandler("Insufficient balance", 400));
-//     }
-
-//     // creating transaction
-//     try {
-//       const result = await prisma.transaction.create({
-//         data: {
-//           userId: req.user!.id,
-//           openingBalance: user?.balance!,
-//           closingBalance:
-//             type === "sell"
-//               ? user?.balance! + stockPrice * stockQuantity
-//               : user?.balance! - stockPrice * stockQuantity,
-//           usedBalance: stockPrice * stockQuantity,
-//           type: type === "buy" ? "withdrawal" : "deposit",
-//           status: "success",
-
-//         },
-//       });
-
-//       if (!result) {
-//         return next(new ErrorHandler("Error in executing order", 400));
-//       }
-//       // updating user balance
-//       const updatedUser = await prisma.user.update({
-//         where: { id: user?.id },
-//         data: {
-//           balance:
-//             type === "sell"
-//               ? user?.balance! + stockPrice * stockQuantity
-//               : user?.balance! - stockPrice * stockQuantity,
-//         },
-//       });
-//       if (!updatedUser) {
-//         return next(new ErrorHandler("Error in updating balance", 400));
-//       }
-//       // creating order
-//       const order = await prisma.order.create({
-//         data: {
-//           userId: req.user!.id,
-//           stockName,
-//           stockQuantity,
-//           stockPrice,
-//           stockSymbol,
-//           type,
-//           stockTotal: stockPrice * stockQuantity,
-//           status: "success",
-//           transactionId: result.id,
-//           description: `Order executed for ${stockQuantity} shares of ${stockName} at ${stockPrice} per share.`,
-//         },
-//       });
-
-//       const userPortfolio = await prisma.portfolio.upsert({
-//         where: { userId: req.user?.id },
-//         update: {
-//           stocks: {
-//             upsert: {
-//               where: { stockSymbol },
-//               update: {
-//                 stockName,
-//                 stockQuantity:
-//                   type === "buy"
-//                     ? { increment: stockQuantity }
-//                     : { decrement: stockQuantity },
-//                 stockPrice,
-//               },
-//               create: {
-//                 stockName,
-//                 stockSymbol,
-//                 stockQuantity,
-//                 stockPrice,
-//               },
-//             },
-//           },
-//         },
-//       });
-//     } catch (error) {
-//       await prisma.transaction.create({
-//         data: {
-//           userId: user?.id,
-//           openingBalance: user!?.balance,
-//           closingBalance: user!?.balance,
-//           usedBalance: stockPrice * stockQuantity,
-//           type: type === "buy" ? "withdrawal" : "deposit",
-//           status: "failed",
-//           currency,
-//         },
-//       });
-
-//       await prisma.order.create({
-//         data: {
-//           userId: user?.id,
-//           stockName,
-//           stockQuantity,
-//           stockPrice,
-//           stockSymbol,
-//           type,
-//           stockTotal: stockPrice * stockQuantity,
-//           status: "failed",
-//           description: `Order execution failed for ${stockQuantity} shares of ${stockName} at ${stockPrice} per share.`,
-//         },
-//       });
-//       return next(new ErrorHandler("Error in executing order", 400));
-//     }
-
-//     res.status(200).json({
-//       success: true,
-//       message: "Order Executed Successfully",
-//     });
-//   }
-// );
-
+/**
+ * Execute a delivery buy/sell order.
+ *
+ * Two rules this endpoint now enforces that it previously did not:
+ *  1. The account traded is ALWAYS the authenticated user (`req.user.id`).
+ *     It used to come from `req.body.userId`, letting anyone trade on anyone
+ *     else's account (S-03).
+ *  2. The fill price is ALWAYS the server's live price. The client's `rate` is
+ *     ignored; sending one is harmless but has no effect (S-02).
+ */
 export const ExecuteOrder = TryCatch(
   async (
     req: Request<{}, {}, TradeRequestBody>,
     res: Response,
     next: NextFunction,
   ) => {
-    const {
-      userId,
-      stockName,
-      quantity,
-      rate,
-      type,
-      orderMode = "delivery",
-    } = req.body as TradeRequestBody & { orderMode?: string };
+    const userId = req.user?.id;
+    if (!userId) {
+      return next(
+        new ErrorHandler("Please login to access this resource", 401),
+      );
+    }
+
+    const { stockName: rawStockName, orderMode = "delivery" } =
+      req.body as TradeRequestBody & { orderMode?: string };
+
+    const stockName = validateString(rawStockName, "stockName");
+    const type = validateEnum(req.body.type, ["buy", "sell"] as const, "type");
+    const quantity = validateQuantity(req.body.quantity);
+
+    // Server-authoritative price. No fallback to the client's value: if we have
+    // no fresh quote we refuse the order rather than fill it at whatever the
+    // caller claims the market is.
+    const rate = getLivePriceINR(stockName, "crypto");
+    if (rate === null) {
+      return next(
+        new ErrorHandler(
+          `No live price available for ${stockName}. Please try again shortly.`,
+          503,
+        ),
+      );
+    }
+
     const txRecord = await prisma.$transaction(
       async (tx: Prisma.TransactionClient) => {
         // 1) Fetch user
         const user = await tx.user.findUnique({ where: { id: userId } });
-        if (!user) throw new Error("User not found");
+        if (!user) throw new ErrorHandler("User not found", 404);
 
         const cost = quantity * rate;
         const openingBalance = user.balance;
@@ -310,54 +262,54 @@ export const ExecuteOrder = TryCatch(
 
         // 2) Buy vs Sell logic
         if (type === "buy") {
+          // NOTE: `throw`, not `return`. Returning an ErrorHandler from the
+          // transaction callback resolved it, and the caller then responded
+          // 200 "Transaction successful" for a trade that never happened (S-04).
           if (openingBalance < cost)
-            return new ErrorHandler("Insufficient balance", 400);
-
-          const existing = await tx.portfolio.findFirst({
-            where: { userId, stockName },
-          });
+            throw new ErrorHandler("Insufficient balance", 400);
 
           closingBalance = openingBalance - cost;
 
-          if (existing) {
-            await tx.portfolio.update({
-              where: { id: existing.id },
-              data: {
-                stockQuantity: existing.stockQuantity + quantity,
-                stockTotal: existing.stockTotal + cost,
-              },
-            });
-          } else {
-            await tx.portfolio.create({
-              data: {
-                userId,
-                stockName,
-                stockPrice: rate,
-                stockQuantity: quantity,
-                stockSymbol: stockName,
-                stockTotal: cost,
-              },
-            });
-          }
+          // upsert on the actual unique constraint: two concurrent buys of the
+          // same symbol used to both see "no row", both insert, and the loser
+          // died on a P2002 unique violation surfaced as a 500 (S-21).
+          await tx.portfolio.upsert({
+            where: { userId_stockSymbol: { userId, stockSymbol: stockName } },
+            update: {
+              stockQuantity: { increment: quantity },
+              stockTotal: { increment: cost },
+            },
+            create: {
+              userId,
+              stockName,
+              stockPrice: rate,
+              stockQuantity: quantity,
+              stockSymbol: stockName,
+              stockTotal: cost,
+            },
+          });
         } else {
           // -- sell
-          const existing = await tx.portfolio.findFirst({
-            where: { userId, stockName },
+          const existing = await tx.portfolio.findUnique({
+            where: { userId_stockSymbol: { userId, stockSymbol: stockName } },
           });
           if (!existing || existing.stockQuantity < quantity) {
-            return new ErrorHandler(`Not enough ${stockName} to sell`, 400);
+            throw new ErrorHandler(`Not enough ${stockName} to sell`, 400);
           }
 
           if (existing.stockQuantity === quantity) {
             // sold entire holding → delete record
             await tx.portfolio.delete({ where: { id: existing.id } });
           } else {
-            // sold a portion → subtract quantity
+            // Sold a portion. Cost basis is reduced proportionally at the
+            // average price paid — subtracting the sale proceeds instead would
+            // corrupt the basis (the same defect fixed in commodities, S-11).
+            const avgPrice = existing.stockTotal / existing.stockQuantity;
             await tx.portfolio.update({
               where: { id: existing.id },
               data: {
                 stockQuantity: existing.stockQuantity - quantity,
-                stockTotal: existing.stockTotal - cost,
+                stockTotal: existing.stockTotal - avgPrice * quantity,
               },
             });
           }
@@ -406,9 +358,17 @@ export const ExecuteOrder = TryCatch(
       },
     );
 
-    res.json({ message: "Transaction successful", transaction: txRecord });
+    res.json({
+      success: true,
+      message: "Transaction successful",
+      transaction: txRecord,
+      // The price the order actually filled at, so clients display the real
+      // number rather than the one they optimistically sent.
+      executedPrice: rate,
+    });
   },
 );
+
 
 export const getMyPortfolio = TryCatch(
   async (req: Request, res: Response, next: NextFunction) => {
@@ -490,25 +450,45 @@ export const requestPasswordReset = TryCatch(
     const { email } = req.body;
     if (!email) return next(new ErrorHandler("Email is required", 400));
 
-    const user = await prisma.user.findUnique({ where: { email } });
-    // Always respond generically so we don't reveal whether email exists
-    if (!user) {
-      return res.status(200).json({
-        success: true,
-        message: "If that email exists, an OTP has been sent.",
+    const normalisedEmail = String(email).trim().toLowerCase();
+
+    // Generic response either way, so the endpoint can't be used to test which
+    // addresses have accounts.
+    const genericResponse = {
+      success: true,
+      message: "If that email exists, an OTP has been sent.",
+    };
+
+    // Cooldown: without it this endpoint is an unauthenticated email-send
+    // amplifier pointed at any address the caller chooses (S-10).
+    const existing = otpStore.get(normalisedEmail);
+    if (existing && Date.now() - existing.issuedAt < OTP_RESEND_COOLDOWN_MS) {
+      return res.status(429).json({
+        success: false,
+        message: "An OTP was just sent. Please wait a minute before retrying.",
       });
     }
 
-    const otp = String(Math.floor(100000 + Math.random() * 900000));
-    const expiresAt = Date.now() + 10 * 60 * 1000; // 10 minutes
-    otpStore.set(email, { otp, expiresAt });
-
-    await sendOtpEmail(email, otp);
-
-    res.status(200).json({
-      success: true,
-      message: "OTP sent to your email. Valid for 10 minutes.",
+    const user = await prisma.user.findUnique({
+      where: { email: normalisedEmail },
     });
+    if (!user) {
+      return res.status(200).json(genericResponse);
+    }
+
+    // crypto.randomInt, not Math.random — this is a credential-reset token.
+    const otp = String(crypto.randomInt(100000, 1000000));
+    const now = Date.now();
+    otpStore.set(normalisedEmail, {
+      otp,
+      expiresAt: now + OTP_TTL_MS,
+      issuedAt: now,
+      attempts: 0,
+    });
+
+    await sendOtpEmail(normalisedEmail, otp);
+
+    res.status(200).json(genericResponse);
   },
 );
 
@@ -528,7 +508,9 @@ export const resetPasswordWithOtp = TryCatch(
         new ErrorHandler("Password must be at least 6 characters", 400),
       );
 
-    const record = otpStore.get(email);
+    const normalisedEmail = String(email).trim().toLowerCase();
+
+    const record = otpStore.get(normalisedEmail);
     if (!record)
       return next(
         new ErrorHandler(
@@ -538,21 +520,36 @@ export const resetPasswordWithOtp = TryCatch(
       );
 
     if (Date.now() > record.expiresAt) {
-      otpStore.delete(email);
+      otpStore.delete(normalisedEmail);
       return next(
         new ErrorHandler("OTP has expired. Please request a new one.", 400),
       );
     }
 
-    if (record.otp !== otp) return next(new ErrorHandler("Invalid OTP.", 400));
+    // Attempt cap. A 6-digit code with unlimited guesses inside a 10-minute
+    // window is 900k possibilities against no resistance at all (S-10).
+    record.attempts += 1;
+    if (record.attempts > OTP_MAX_ATTEMPTS) {
+      otpStore.delete(normalisedEmail);
+      return next(
+        new ErrorHandler(
+          "Too many incorrect attempts. Please request a new OTP.",
+          429,
+        ),
+      );
+    }
+
+    if (!timingSafeEqualStr(record.otp, String(otp))) {
+      return next(new ErrorHandler("Invalid OTP.", 400));
+    }
 
     const hashedPassword = await bcrypt.hash(newPassword, 10);
     await prisma.user.update({
-      where: { email },
+      where: { email: normalisedEmail },
       data: { password: hashedPassword },
     });
 
-    otpStore.delete(email); // OTP consumed
+    otpStore.delete(normalisedEmail); // OTP consumed
 
     res.status(200).json({
       success: true,
@@ -674,7 +671,19 @@ export const updateProfile = TryCatch(
   },
 );
 
-// Get Profit/Loss statistics
+/**
+ * Profit/Loss statistics.
+ *
+ * CAVEAT (review S-19): `realizedPL` here is `totalSell - totalBuy` — net cash
+ * flow, not realised profit. A position that is still open counts as a full
+ * loss until it is sold, so a user who has only ever bought sees a large
+ * negative number. The arithmetic is right; the label is misleading.
+ *
+ * Computing true realised P/L means matching each sell against the cost basis
+ * of the lots it closes (FIFO or average). Left as-is deliberately because all
+ * three clients render this field today and changing its meaning silently would
+ * be worse than the current inaccuracy.
+ */
 export const getProfitLoss = TryCatch(
   async (req: Request, res: Response, next: NextFunction) => {
     if (!req.user) {
@@ -683,8 +692,16 @@ export const getProfitLoss = TryCatch(
     const userId = req.user.id;
     const { days } = req.query;
 
-    // Calculate date range (default: 365 days)
-    const daysNum = days ? parseInt(days as string, 10) : 365;
+    // Calculate date range (default: 365 days).
+    // Guarded: `?days=abc` used to yield NaN, which made setDate produce an
+    // Invalid Date and Prisma throw a 500 on the `gte` filter (S-19).
+    const parsedDays = days !== undefined ? Number(days) : 365;
+    if (!Number.isFinite(parsedDays) || parsedDays < 1) {
+      return next(
+        new ErrorHandler("days must be a positive number of days", 400),
+      );
+    }
+    const daysNum = Math.min(Math.floor(parsedDays), 3650); // cap at ~10 years
     const startDate = new Date();
     startDate.setDate(startDate.getDate() - daysNum);
 
