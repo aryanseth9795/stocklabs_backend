@@ -73,15 +73,44 @@ in_certbot() {
 }
 
 # ---------------------------------------------------------------------------
-# Already have a real certificate? Then there is nothing to bootstrap.
+# What, if anything, is already installed?
+#
+# Ask the CERTIFICATE, not a marker file. An earlier version of this script
+# recorded "this is a placeholder" by touching a sentinel — and the touch was
+# itself the command that failed on a root-owned directory, so a self-signed
+# placeholder was left looking exactly like a real certificate. A cert states
+# its own issuer; that cannot get out of sync with reality.
 # ---------------------------------------------------------------------------
-if in_certbot "[ -f /etc/letsencrypt/live/${ACME_DOMAIN}/fullchain.pem ] && [ ! -f /etc/letsencrypt/live/${ACME_DOMAIN}/.self-signed ]" 2>/dev/null; then
-  echo "==> A real certificate already exists for ${ACME_DOMAIN} — nothing to do."
-  echo "    Renewal is handled by the certbot service on its own loop."
-  echo "    To force reissue: ACME_FORCE=1 $0"
-  [[ "${ACME_FORCE:-0}" != "1" ]] && exit 0
-  echo "    ACME_FORCE=1 set — reissuing anyway."
-fi
+cert_state() {
+  in_certbot "
+    f=/etc/letsencrypt/live/${ACME_DOMAIN}/fullchain.pem
+    [ -f \"\$f\" ] || { echo NONE; exit 0; }
+    issuer=\$(openssl x509 -in \"\$f\" -noout -issuer 2>/dev/null || echo unreadable)
+    case \"\$issuer\" in
+      *STAGING*|*Fake*)   echo STAGING ;;
+      *Let*Encrypt*|*R1*|*E1*|*R10*|*R11*|*E5*|*E6*) echo PRODUCTION ;;
+      *unreadable*)       echo BROKEN ;;
+      *)                  echo SELFSIGNED ;;
+    esac" 2>/dev/null | tr -d '\r\n'
+}
+
+STATE=$(cert_state)
+echo "==> existing certificate: ${STATE}"
+
+case "$STATE" in
+  PRODUCTION)
+    if [[ "${ACME_STAGING:-1}" == "0" && "${ACME_FORCE:-0}" != "1" ]]; then
+      echo "    A trusted certificate is already installed — nothing to do."
+      echo "    Renewal is handled by the certbot service on its own loop."
+      echo "    To reissue anyway: ACME_FORCE=1 ACME_STAGING=0 bash $0"
+      exit 0
+    fi
+    ;;
+  STAGING)    echo "    (staging cert present — will be replaced)" ;;
+  SELFSIGNED) echo "    (placeholder only — no real certificate yet)" ;;
+  BROKEN)     echo "    (unreadable certificate — will be replaced)" ;;
+  NONE)       echo "    (none)" ;;
+esac
 
 # ---------------------------------------------------------------------------
 # 1. Plant a self-signed placeholder so nginx can pass `nginx -t` and boot.
