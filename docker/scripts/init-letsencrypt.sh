@@ -60,29 +60,47 @@ fi
 
 mkdir -p ./certbot/conf ./certbot/www ./certbot/log
 
+# Everything under certbot/conf is created by containers running as root, so the
+# host user cannot read, write or delete inside it. All manipulation of that tree
+# therefore happens inside a container too — this helper is the only way we touch
+# it. (The first run appears to work from the host purely because the directories
+# do not exist yet; the second run fails with "Permission denied".)
+in_certbot() {
+  docker run --rm \
+    -v "${ROOT_DIR}/certbot/conf:/etc/letsencrypt" \
+    --entrypoint sh \
+    certbot/certbot -c "$1"
+}
+
 # ---------------------------------------------------------------------------
 # Already have a real certificate? Then there is nothing to bootstrap.
 # ---------------------------------------------------------------------------
-if [[ -f "${LIVE_DIR}/fullchain.pem" && ! -f "${LIVE_DIR}/.self-signed" ]]; then
-  echo "==> A certificate already exists at ${LIVE_DIR} — nothing to do."
+if in_certbot "[ -f /etc/letsencrypt/live/${ACME_DOMAIN}/fullchain.pem ] && [ ! -f /etc/letsencrypt/live/${ACME_DOMAIN}/.self-signed ]" 2>/dev/null; then
+  echo "==> A real certificate already exists for ${ACME_DOMAIN} — nothing to do."
   echo "    Renewal is handled by the certbot service on its own loop."
-  exit 0
+  echo "    To force reissue: ACME_FORCE=1 $0"
+  [[ "${ACME_FORCE:-0}" != "1" ]] && exit 0
+  echo "    ACME_FORCE=1 set — reissuing anyway."
 fi
 
 # ---------------------------------------------------------------------------
 # 1. Plant a self-signed placeholder so nginx can pass `nginx -t` and boot.
 # ---------------------------------------------------------------------------
+echo "==> Clearing any previous certificate state for ${ACME_DOMAIN}"
+# Done first, and in one place. certbot's live/ holds SYMLINKS into archive/, so
+# writing a placeholder over them leaves a tangle of real files and dangling
+# links that certbot then refuses to reason about. Start from nothing instead.
+in_certbot "rm -rf /etc/letsencrypt/live/${ACME_DOMAIN} \
+                  /etc/letsencrypt/archive/${ACME_DOMAIN} \
+                  /etc/letsencrypt/renewal/${ACME_DOMAIN}.conf"
+
 echo "==> Planting a temporary self-signed certificate so nginx can start"
-mkdir -p "${LIVE_DIR}"
-docker run --rm \
-  -v "${ROOT_DIR}/certbot/conf:/etc/letsencrypt" \
-  --entrypoint openssl \
-  certbot/certbot \
-  req -x509 -nodes -newkey rsa:2048 -days 1 \
-    -keyout "/etc/letsencrypt/live/${ACME_DOMAIN}/privkey.pem" \
-    -out    "/etc/letsencrypt/live/${ACME_DOMAIN}/fullchain.pem" \
-    -subj "/CN=${ACME_DOMAIN}"
-touch "${LIVE_DIR}/.self-signed"
+in_certbot "mkdir -p /etc/letsencrypt/live/${ACME_DOMAIN} && \
+  openssl req -x509 -nodes -newkey rsa:2048 -days 1 \
+    -keyout /etc/letsencrypt/live/${ACME_DOMAIN}/privkey.pem \
+    -out    /etc/letsencrypt/live/${ACME_DOMAIN}/fullchain.pem \
+    -subj '/CN=${ACME_DOMAIN}' 2>/dev/null && \
+  touch /etc/letsencrypt/live/${ACME_DOMAIN}/.self-signed"
 
 # ---------------------------------------------------------------------------
 # 2. Start just the edge. The app tier is not needed to answer an ACME
@@ -102,8 +120,11 @@ fi
 # 3. Swap the placeholder for a real certificate.
 # ---------------------------------------------------------------------------
 echo "==> Requesting a certificate for ${ACME_DOMAIN}"
-rm -rf "${LIVE_DIR}" "./certbot/conf/archive/${ACME_DOMAIN}" \
-       "./certbot/conf/renewal/${ACME_DOMAIN}.conf"
+# Drop the placeholder now that nginx has booted and is holding it open, so
+# certbot writes into a clean directory rather than around a self-signed pair.
+in_certbot "rm -rf /etc/letsencrypt/live/${ACME_DOMAIN} \
+                  /etc/letsencrypt/archive/${ACME_DOMAIN} \
+                  /etc/letsencrypt/renewal/${ACME_DOMAIN}.conf"
 
 STAGING_FLAG=""
 [[ "$STAGING" == "1" ]] && STAGING_FLAG="--staging"
