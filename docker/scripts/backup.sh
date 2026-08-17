@@ -1,64 +1,70 @@
-#!/usr/bin/env bash
+#!/bin/sh
 #
 # Nightly Postgres backup with rotation.
 #
-# Run from the host, from cron, next to docker-compose.prod.yml:
-#   0 3 * * *  cd /srv/stocklabs && ./docker/scripts/backup.sh >> /var/log/stocklabs-backup.log 2>&1
+# Runs INSIDE the `backup` service (postgres:16-alpine), on the internal
+# network, reaching the database over compose DNS. It therefore has psql/pg_dump
+# but no Docker CLI and no Docker socket — do not reintroduce `docker compose
+# exec` here.
 #
-# The database lives in a container volume that nothing else replicates. Since
-# the migration dropped the managed Neon instance, this script is the only thing
-# standing between a bad `docker volume rm` and total data loss.
+# Invoked on a loop by the service's command: once immediately at deploy (so a
+# broken backup config is discovered now, not 24 h later) and every 24 h after.
+#
+# Since the migration dropped managed Postgres, the files this writes are the
+# only copy of the data that is not inside a single Docker volume.
 
-set -euo pipefail
+set -eu
 
-COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.prod.yml}"
-BACKUP_DIR="${BACKUP_DIR:-./backups}"
-RETENTION_DAYS="${RETENTION_DAYS:-14}"
+PGHOST="${PGHOST:-postgres}"
+PGUSER="${POSTGRES_USER:-app}"
+PGDATABASE="${POSTGRES_DB:-stocklabs}"
+BACKUP_DIR="${BACKUP_DIR:-/backups}"
+RETENTION_DAYS="${BACKUP_RETENTION_DAYS:-14}"
 
-# Read the credentials from the same env file the stack uses, so this can never
-# drift from what the database was actually created with.
-ENV_FILE="${ENV_FILE:-.env.prod}"
-if [[ -f "$ENV_FILE" ]]; then
-  # shellcheck disable=SC1090
-  set -a; source "$ENV_FILE"; set +a
-fi
-
-PG_USER="${POSTGRES_USER:-app}"
-PG_DB="${POSTGRES_DB:-stocklabs}"
+# pg_dump reads this; it is already in the container env from .env.prod.
+PGPASSWORD="${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}"
+export PGPASSWORD PGHOST PGUSER PGDATABASE
 
 mkdir -p "$BACKUP_DIR"
 STAMP="$(date +%F-%H%M)"
 OUT="$BACKUP_DIR/stocklabs-$STAMP.dump"
 
-echo "[backup] $(date -Is) dumping $PG_DB -> $OUT"
+echo "[backup] $(date -Iseconds) dumping $PGDATABASE from $PGHOST -> $OUT"
 
-# -Fc is the custom format: already compressed, and restorable selectively with
-# pg_restore. -T (no TTY) matters under cron, where there is no terminal.
-docker compose -f "$COMPOSE_FILE" exec -T postgres \
-  pg_dump -U "$PG_USER" -Fc "$PG_DB" > "$OUT"
+# -Fc is the custom format: compressed, and restorable selectively with
+# pg_restore. Write to a .part first so a crash mid-dump cannot leave a
+# truncated file that later looks like a valid backup.
+if ! pg_dump -Fc "$PGDATABASE" > "$OUT.part"; then
+  echo "[backup] FAILED: pg_dump exited non-zero" >&2
+  rm -f "$OUT.part"
+  exit 1
+fi
 
-if [[ ! -s "$OUT" ]]; then
+if [ ! -s "$OUT.part" ]; then
   echo "[backup] FAILED: dump is empty" >&2
-  rm -f "$OUT"
+  rm -f "$OUT.part"
   exit 1
 fi
 
 # An unverified backup is not a backup. `--list` reads the archive's table of
-# contents, which is enough to catch a truncated or corrupt dump immediately
-# rather than at 3am on the day you need it.
+# contents, which catches a truncated or corrupt dump now rather than at 3am on
+# the day it is needed.
 #
-# This is NOT a substitute for periodically restoring into a scratch database
-# and querying it — see docs/runbook.md. It only proves the file is well-formed.
-if ! docker compose -f "$COMPOSE_FILE" exec -T postgres \
-      pg_restore --list /dev/stdin < "$OUT" > /dev/null 2>&1; then
+# This proves the file is well-formed. It does NOT prove it restores — do that
+# by hand periodically, per docs/runbook.md.
+if ! pg_restore --list "$OUT.part" > /dev/null 2>&1; then
   echo "[backup] FAILED: dump did not survive pg_restore --list" >&2
+  rm -f "$OUT.part"
   exit 1
 fi
 
-SIZE="$(du -h "$OUT" | cut -f1)"
-echo "[backup] ok — $SIZE"
+mv "$OUT.part" "$OUT"
+echo "[backup] ok — $(du -h "$OUT" | cut -f1)"
 
 # Rotation runs only after a verified success, so a run of failures can never
 # delete the last known-good backup.
-DELETED="$(find "$BACKUP_DIR" -name 'stocklabs-*.dump' -type f -mtime "+$RETENTION_DAYS" -print -delete | wc -l)"
-echo "[backup] rotated out $DELETED file(s) older than ${RETENTION_DAYS}d"
+DELETED=$(find "$BACKUP_DIR" -name 'stocklabs-*.dump' -type f -mtime "+$RETENTION_DAYS" -print -delete | wc -l)
+echo "[backup] rotated out $(echo "$DELETED" | tr -d ' ') file(s) older than ${RETENTION_DAYS}d"
+
+# Leave a breadcrumb the runbook's triage step can read without parsing logs.
+date -Iseconds > "$BACKUP_DIR/.last-success"
