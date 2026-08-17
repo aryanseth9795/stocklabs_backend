@@ -17,6 +17,15 @@
 FROM node:22-bookworm-slim AS deps
 WORKDIR /app
 
+# Prisma probes the system libssl to decide which query-engine binary to use.
+# The -slim images omit it, so `prisma generate` cannot detect a version, warns,
+# and falls back to the openssl-1.1.x engine — on Bookworm, which ships OpenSSL
+# 3. `prisma migrate deploy` survives that (different binary), so the mismatch
+# passes the migration step and then fails on the first actual query at runtime.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends openssl ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
 # `prisma/` MUST be copied BEFORE `npm ci`.
 #
 # package.json declares "postinstall": "prisma generate", which npm runs at the
@@ -62,6 +71,13 @@ WORKDIR /app
 ENV NODE_ENV=production \
     TZ=UTC \
     PORT=4000
+
+# Same reason as the deps stage, and this is the one that actually matters:
+# postinstall runs `prisma generate` here too, and the query engine this image
+# loads on every request must match the platform's OpenSSL.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends openssl ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
 
 # Same ordering rule as stage 1: schema before install, because
 # `npm ci --omit=dev` still runs postinstall.
