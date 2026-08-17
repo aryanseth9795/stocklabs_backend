@@ -16,7 +16,14 @@ const ENTRY_PRICE = 5_000_000;
 const LIVE_PRICE = 4_000_000; // price fell → the short is in profit
 const QUANTITY = 2;
 
-function makeRow(symbol: string, priceInr: number): Row {
+/** `tsMs` defaults to "now": getLivePriceINR refuses a row older than
+ *  MAX_PRICE_AGE_MS, so an unstamped fixture would 503 every short. Overridable
+ *  so a test can build a deliberately stale row. */
+function makeRow(
+  symbol: string,
+  priceInr: number,
+  tsMs: number = Date.now(),
+): Row {
   return {
     stockName: symbol.toLowerCase(),
     stocksymbol: symbol,
@@ -26,6 +33,7 @@ function makeRow(symbol: string, priceInr: number): Row {
     stockChangeINR: 0,
     stockChangePercentage: 0,
     ts: new Date().toISOString(),
+    tsMs,
   };
 }
 

@@ -26,6 +26,13 @@ export default defineConfig({
   test: {
     environment: "node",
     include: ["tests/**/*.test.ts"],
+    // The default 5s is measured from the start of the first test in a file,
+    // which is also when vitest transforms that file's whole module graph. The
+    // graph grew (Redis, the commodity consumer, the role split), and with seven
+    // files transforming in parallel the first test in a file can spend most of
+    // its budget waiting on compilation rather than on anything it asserts.
+    // These same tests finish in under 2s once warm.
+    testTimeout: 20_000,
     // Real-looking secrets so env.ts passes validation without touching .env.
     // Deliberately NOT the old hardcoded fallbacks — token.test.ts asserts that
     // tokens signed with those are rejected.

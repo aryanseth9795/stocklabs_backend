@@ -1,0 +1,384 @@
+# StockLabs backend — production stack.
+#
+#   docker compose -f docker-compose.prod.yml up -d --build
+#   docker compose -f docker-compose.prod.yml up -d --scale api=4
+#
+# Topology
+#   internet :80/:443 -> nginx (the ONLY service that publishes host ports)
+#                          |
+#                   [ api x N ]  <- scalable, stateless
+#                   [ worker x 1 ] <- NEVER scale this (see the worker service)
+#                          |
+#                   [ postgres ] [ redis ]  <- internal network, no host ports
+#
+# Real values live in .env.prod on the VM (gitignored, never baked into the
+# image). See .env.example for the full contract.
+
+# ---------------------------------------------------------------------------
+# Shared fragments
+# ---------------------------------------------------------------------------
+
+x-logging: &logging
+  # Without caps, json-file logs grow until the VM's disk fills — which takes
+  # Postgres down with it. This is the whole "log rotation" requirement.
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+x-node: &node
+  # One image, two roles. Built once; `api`, `worker` and `migrate` all run it.
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: stocklabs-server:prod
+  env_file:
+    - .env.prod
+  # init: true puts a real init (tini) at PID 1 so zombie processes are reaped
+  # and signals reach node. Combined with the exec-form CMD in the Dockerfile,
+  # this is what makes SIGTERM actually arrive.
+  init: true
+  # 45 s > the app's 15 s shutdown watchdog > the 8 s drain delay. The process
+  # always exits under its own power; SIGKILL is never reached in normal
+  # operation.
+  stop_grace_period: 45s
+  restart: unless-stopped
+  logging: *logging
+
+x-node-healthcheck: &node-healthcheck
+  # Uses Node's global fetch (Node 18+). Deliberately NOT curl/wget: the runtime
+  # image is node:22-bookworm-slim, which ships neither, and adding curl to a
+  # slim image just to poll a health endpoint is an unnecessary attack surface.
+  # /readyz, not /healthz — a process that is alive but whose Redis subscription
+  # died serves a permanently frozen board, and only /readyz catches that.
+  test:
+    - CMD
+    - node
+    - -e
+    - "fetch('http://127.0.0.1:4000/readyz').then(r => process.exit(r.status === 200 ? 0 : 1)).catch(() => process.exit(1))"
+  interval: 15s
+  timeout: 5s
+  retries: 3
+  # Generous: boot waits on Redis board hydration (capped at 10 s in the app)
+  # plus Prisma connect.
+  start_period: 60s
+
+services:
+  # -------------------------------------------------------------------------
+  # Data tier — internal network only, no published ports.
+  # -------------------------------------------------------------------------
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    env_file:
+      - .env.prod # POSTGRES_USER / POSTGRES_PASSWORD / POSTGRES_DB
+    command:
+      - postgres
+      # Prisma's default pool is (cpus * 2 + 1) PER PROCESS. Keep
+      # replicas x connection_limit (set via ?connection_limit= in DATABASE_URL)
+      # comfortably under this number, and leave headroom for `migrate`,
+      # `backup` and a human with psql.
+      - -c
+      - max_connections=100
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - internal
+    # NO `ports:`. Postgres must never be reachable from the host or internet.
+    healthcheck:
+      test: ["CMD-SHELL", 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    # Default 64 MB /dev/shm is too small for parallel query workers and shows up
+    # as confusing "could not resize shared memory segment" errors.
+    shm_size: 256mb
+    logging: *logging
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+          memory: 768M
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command:
+      - redis-server
+      # No RDB snapshots, no AOF. Everything in here is reconstructible: ticks
+      # are republished within a second, OTPs can be re-requested, the Socket.IO
+      # registry rebuilds on reconnect. Durability would buy nothing and cost
+      # fsync latency on the hot tick path.
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --maxmemory
+      - 256mb
+      # noeviction is DELIBERATE and must not be "optimised" to allkeys-lru.
+      # Under memory pressure LRU would silently drop `tick:*` keys (cold
+      # replicas then hydrate an empty board and refuse trades) or an in-flight
+      # `otp:*` key (password reset fails for one user, with no error anywhere).
+      # noeviction turns that into a loud write error instead of silent
+      # corruption.
+      - --maxmemory-policy
+      - noeviction
+    volumes:
+      # Inert while persistence is off, but present so that turning `--appendonly
+      # yes` back on does not silently write to a container-local layer.
+      - redisdata:/data
+    networks:
+      - internal
+    # NO `ports:`.
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    logging: *logging
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          # maxmemory 256mb + copy-on-write/fragmentation headroom.
+          memory: 384M
+
+  # -------------------------------------------------------------------------
+  # One-shot schema migration. Everything else waits for this to exit 0.
+  # -------------------------------------------------------------------------
+
+  migrate:
+    <<: *node
+    # `restart: "no"` — this is a task, not a service. Quoted because bare `no`
+    # is YAML boolean false.
+    restart: "no"
+    command: ["npx", "prisma", "migrate", "deploy"]
+    environment:
+      # Not an API or a worker: it must not start feeds, crons or listeners.
+      ROLE: api
+      NODE_OPTIONS: --max-old-space-size=384
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - internal
+    # A migration that hangs should not be killed mid-DDL.
+    stop_grace_period: 120s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+
+  # -------------------------------------------------------------------------
+  # Worker — EXACTLY ONE. See the warning below before touching this.
+  # -------------------------------------------------------------------------
+
+  worker:
+    <<: *node
+    environment:
+      ROLE: worker
+      NODE_OPTIONS: --max-old-space-size=384
+    # ###################################################################
+    # #  NEVER RUN THIS SERVICE AT MORE THAN 1 REPLICA.                 #
+    # #                                                                 #
+    # #  It owns everything that must happen exactly once:              #
+    # #    - the single Binance upstream WebSocket (N connections from  #
+    # #      one VM IP gets the IP rate-limited/banned)                 #
+    # #    - the single commodity SSE upstream (third party, free tier) #
+    # #    - the midnight auto-cut cron (N replicas => N scans of every #
+    # #      open short, each closing at a slightly different price)    #
+    # #    - the 60 s top-50 snapshot logger                            #
+    # #                                                                 #
+    # #  It also writes every tick into Redis. Two writers means N x     #
+    # #  tick writes fanned out to N subscribers: N^2 amplification.    #
+    # ###################################################################
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    # internal only: the worker serves no public traffic and is not in nginx's
+    # upstream. It still listens on 4000 for its own health endpoints.
+    networks:
+      - internal
+    healthcheck: *node-healthcheck
+
+  # -------------------------------------------------------------------------
+  # API — scale this one.
+  #   docker compose -f docker-compose.prod.yml up -d --scale api=4
+  # -------------------------------------------------------------------------
+
+  api:
+    <<: *node
+    # NO `container_name:` — a fixed name makes the second replica fail with
+    # "container name already in use", so --scale silently caps at 1.
+    # NO `ports:` — a fixed host port makes the second replica fail with
+    # "port is already allocated". nginx is the only thing that publishes ports;
+    # it reaches replicas over the compose network by service DNS.
+    # NO `deploy.replicas:` either — leaving it unset lets --scale own the count.
+    expose:
+      - "4000"
+    environment:
+      ROLE: api
+      # 384 MB heap under a 512 MB container limit leaves room for the native
+      # heap, ws buffers and Prisma. Without it V8 sizes its heap from the HOST's
+      # RAM, ignores the cgroup limit, and gets OOM-killed instead of GC-ing.
+      NODE_OPTIONS: --max-old-space-size=384
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      # edge: reachable by nginx. internal: reaches postgres/redis.
+      - edge
+      - internal
+    healthcheck: *node-healthcheck
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+
+  # -------------------------------------------------------------------------
+  # Edge
+  # -------------------------------------------------------------------------
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    # The only service in the stack that binds host ports.
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./docker/nginx/snippets:/etc/nginx/snippets:ro
+      - ./certbot/conf:/etc/letsencrypt:ro
+      - ./certbot/www:/var/www/certbot:ro
+    networks:
+      - edge
+    depends_on:
+      api:
+        # service_started, not service_healthy: nginx resolves `api` lazily at
+        # request time (resolver + variable proxy_pass), so it does not need a
+        # ready upstream to boot — and blocking the edge on app readiness would
+        # mean no ACME challenge endpoint during a bad deploy.
+        condition: service_started
+    # Reload every 6 h so a certbot renewal is picked up without a restart, and
+    # without giving any container access to the Docker socket.
+    command:
+      - /bin/sh
+      - -c
+      - |
+        while :; do sleep 21600 & wait $${!}; nginx -s reload 2>/dev/null || true; done &
+        exec nginx -g 'daemon off;'
+    healthcheck:
+      # -q so a failing upstream does not make nginx itself look unhealthy;
+      # this checks that nginx is listening and its config is loadable.
+      test: ["CMD", "nginx", "-t"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging: *logging
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 192M
+
+  certbot:
+    image: certbot/certbot:latest
+    restart: unless-stopped
+    env_file:
+      - .env.prod # ACME_DOMAIN / ACME_EMAIL (used by the bootstrap command in docker/README.md)
+    volumes:
+      - ./certbot/conf:/etc/letsencrypt
+      - ./certbot/www:/var/www/certbot
+      - ./certbot/log:/var/log/letsencrypt
+    networks:
+      # Needs egress to acme-v02.api.letsencrypt.org; it never talks to the app.
+      - edge
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        trap exit TERM
+        while :; do
+          certbot renew --webroot -w /var/www/certbot --quiet
+          sleep 43200 & wait $${!}
+        done
+    logging: *logging
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
+
+  # -------------------------------------------------------------------------
+  # Nightly logical backup with rotation.
+  # -------------------------------------------------------------------------
+
+  backup:
+    # Same major as the server so pg_dump's output is guaranteed restorable.
+    image: postgres:16-alpine
+    restart: unless-stopped
+    env_file:
+      - .env.prod # POSTGRES_USER / POSTGRES_PASSWORD / POSTGRES_DB / BACKUP_RETENTION_DAYS
+    volumes:
+      - ./docker/scripts/backup.sh:/usr/local/bin/backup.sh:ro
+      - ./backups:/backups
+    networks:
+      - internal
+    depends_on:
+      postgres:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    # Runs once immediately (so a broken backup config is discovered at deploy
+    # time, not 24 h later) then every 24 h. Invoked via `sh script` rather than
+    # executing it directly, because a bind-mounted file from a Windows checkout
+    # may not carry the +x bit.
+    command:
+      - |
+        while :; do
+          sh /usr/local/bin/backup.sh || echo "[backup] FAILED" >&2
+          sleep 86400 & wait $${!}
+        done
+    logging: *logging
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+
+# ---------------------------------------------------------------------------
+# Networks
+# ---------------------------------------------------------------------------
+networks:
+  # nginx <-> api only.
+  edge:
+    driver: bridge
+  # app tier <-> postgres/redis. Note: NOT `internal: true` — the worker needs
+  # egress to Binance, the commodity feed and Resend. The isolation that matters
+  # here is that postgres and redis are not on `edge` and publish no host ports,
+  # so nothing outside the compose network can reach them.
+  internal:
+    driver: bridge
+
+volumes:
+  pgdata:
+  redisdata:

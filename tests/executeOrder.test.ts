@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import request from "supertest";
 import { createMockPrisma, buildTestApp } from "./helpers/mockPrisma.js";
-import { boardCache } from "../src/utils/priceCache.js";
+import { boardCache, MAX_PRICE_AGE_MS } from "../src/utils/priceCache.js";
 import type { Row } from "../src/types/types.js";
 
 const prisma = createMockPrisma();
@@ -14,7 +14,14 @@ const VICTIM_USER = "someone-elses-account";
 
 const LIVE_PRICE_INR = 5_000_000;
 
-function makeRow(symbol: string, priceInr: number): Row {
+/** `tsMs` defaults to "now": getLivePriceINR refuses a row older than
+ *  MAX_PRICE_AGE_MS, so an unstamped fixture would 503 every order. Overridable
+ *  so a test can build a deliberately stale row. */
+function makeRow(
+  symbol: string,
+  priceInr: number,
+  tsMs: number = Date.now(),
+): Row {
   return {
     stockName: symbol.toLowerCase(),
     stocksymbol: symbol,
@@ -24,6 +31,7 @@ function makeRow(symbol: string, priceInr: number): Row {
     stockChangeINR: 0,
     stockChangePercentage: 0,
     ts: new Date().toISOString(),
+    tsMs,
   };
 }
 
@@ -141,6 +149,24 @@ describe("S-02: ExecuteOrder fills at the server's price", () => {
 
     expect(res.status).toBe(503);
     expect(prisma.order.create).not.toHaveBeenCalled();
+  });
+
+  it("refuses the order with 503 when the cached tick has gone stale", async () => {
+    // A dead upstream leaves the last tick in boardCache forever. Filling
+    // against it means every trade executes at a frozen price indefinitely.
+    boardCache.BTCUSDT = makeRow(
+      "BTCUSDT",
+      LIVE_PRICE_INR,
+      Date.now() - MAX_PRICE_AGE_MS - 1,
+    );
+
+    const res = await request(await app())
+      .post("/execute")
+      .send({ stockName: "BTCUSDT", quantity: 1, type: "buy" });
+
+    expect(res.status).toBe(503);
+    expect(prisma.order.create).not.toHaveBeenCalled();
+    expect(prisma.user.update).not.toHaveBeenCalled();
   });
 });
 

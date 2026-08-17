@@ -1,0 +1,78 @@
+# Build-context exclusions.
+#
+# Everything listed here is either a secret, a host-specific binary artifact that
+# would corrupt a Linux image, or dead weight that busts the layer cache.
+#
+# NOT excluded, deliberately — the build needs all of these:
+#   prisma/            schema + migrations; `npm ci` fails without it (postinstall)
+#   src/  app.ts       the actual sources
+#   tsconfig.json      compiler config
+#   package-lock.json  `npm ci` refuses to run without a lockfile
+
+# ---------------------------------------------------------------------------
+# SECRETS — highest severity entry in this file.
+# ---------------------------------------------------------------------------
+# Server/.env holds live Render/Neon database credentials and BOTH JWT signing
+# secrets. Anything copied into an image layer is readable by anyone who can
+# `docker save` or pull it, and it survives even if a later layer deletes it.
+# Real production values live in .env.prod on the VM and reach the container
+# only through compose `env_file:` at runtime — never through a COPY.
+.env
+.env.*
+*.env
+.env.prod
+.env.example
+
+# ---------------------------------------------------------------------------
+# Host-built binaries that must never enter a Linux image
+# ---------------------------------------------------------------------------
+# Windows-compiled bcrypt binding + Windows Prisma query engines. If these were
+# copied in, `npm ci` would consider the tree satisfied and the container would
+# fail at first import with an ELF/ABI error.
+node_modules
+**/node_modules
+
+# Dead 22 MB artifact from an old `output = "../generated/prisma"` generator
+# block (now commented out in schema.prisma). Contains
+# query_engine-windows.dll.node — a Windows DLL. Never ship it.
+generated
+generated/**
+
+# Stale compiled output, including orphans such as dist/scripts/clearData.js
+# whose source no longer exists. dist/ is rebuilt from source inside the image.
+dist
+
+# ---------------------------------------------------------------------------
+# Not needed at build or runtime
+# ---------------------------------------------------------------------------
+.git
+.gitignore
+.gitattributes
+.github
+
+tests
+vitest.config.ts
+coverage
+
+# Infra: the nginx config and scripts are bind-mounted by compose, not baked in.
+docker
+docker-compose*.yml
+Dockerfile
+.dockerignore
+
+# Operational data written on the VM
+backups
+certbot
+
+# Editor / OS / logs
+.vscode
+.idea
+*.swp
+.DS_Store
+Thumbs.db
+npm-debug.log*
+yarn-error.log*
+
+# Docs
+*.md
+!prisma/**/*.md

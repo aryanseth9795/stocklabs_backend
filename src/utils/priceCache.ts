@@ -35,10 +35,34 @@ export const MAX_PRICE_AGE_MS = 60_000;
 
 export type AssetType = "crypto" | "commodity";
 
-export function setCommodityPrice(symbol: string, price: number): void {
+/**
+ * Record a commodity price that was observed at a KNOWN instant.
+ *
+ * This overload exists for the Redis paths. A replica that boots cold hydrates
+ * commodity prices out of Redis, and those values already have an age — routing
+ * them through `setCommodityPrice` would stamp `Date.now()` and reset the
+ * freshness clock, so an 85-second-old quote would pass the 60 s guard below and
+ * the very next order would fill against it. That is the stale-fill bug the
+ * guard exists to prevent, reintroduced on every replica restart.
+ *
+ * `tsMs` is validated exactly like `price`: a junk timestamp is no more usable
+ * than a junk price, and silently substituting "now" for one is how the bug
+ * above gets back in.
+ */
+export function setCommodityPriceAt(
+  symbol: string,
+  price: number,
+  tsMs: number,
+): void {
   if (!Number.isFinite(price) || price <= 0) return;
+  if (!Number.isFinite(tsMs) || tsMs <= 0) return;
   commodityPriceCache[symbol] = price;
-  commodityUpdatedAt[symbol] = Date.now();
+  commodityUpdatedAt[symbol] = tsMs;
+}
+
+/** Record a commodity price observed right now — the live-feed path. */
+export function setCommodityPrice(symbol: string, price: number): void {
+  setCommodityPriceAt(symbol, price, Date.now());
 }
 
 /**
@@ -57,14 +81,35 @@ export function getLivePriceINR(
     const price = commodityPriceCache[key];
     if (!Number.isFinite(price) || price <= 0) return null;
 
+    // `!updatedAt ||`, not `updatedAt &&`: a price with no timestamp is a price
+    // of unknown age, and the previous form skipped the staleness check
+    // ENTIRELY for it — returning the stale quote instead of refusing it. Every
+    // writer stamps a timestamp today, but Redis hydration is precisely the path
+    // that can produce a value whose clock we never set.
     const updatedAt = commodityUpdatedAt[key];
-    if (updatedAt && Date.now() - updatedAt > MAX_PRICE_AGE_MS) return null;
+    if (!updatedAt || Date.now() - updatedAt > MAX_PRICE_AGE_MS) return null;
 
     return price;
   }
 
   const row = boardCache[symbol.toUpperCase()];
   if (!row) return null;
+
+  // Crypto gets the same staleness rule as commodities. `boardCache` is a plain
+  // in-memory object whose entries never expire, so a dead upstream leaves the
+  // last tick sitting there forever: the Redis keys TTL out, but every buy,
+  // sell, short entry, short cover and midnight auto-cut would keep executing at
+  // a frozen price indefinitely.
+  //
+  // A missing or non-numeric `tsMs` counts as STALE, not fresh — otherwise ticks
+  // written by a build that predates the field would be trusted forever, which
+  // is the same bug wearing a different hat.
+  if (
+    !Number.isFinite(row.tsMs) ||
+    Date.now() - row.tsMs > MAX_PRICE_AGE_MS
+  ) {
+    return null;
+  }
 
   // INR is the unit every order, balance and short position is denominated in.
   const price = row.stockPriceINR;
@@ -85,4 +130,11 @@ export function boardSnapshot(symbols: readonly string[]): Row[] {
  *  writers cannot drift apart, which is exactly what happened in S-14. */
 export function tickKey(symbol: string): string {
   return `tick:${symbol.toLowerCase()}`;
+}
+
+/** Redis key for a commodity's cached price. Same rationale as tickKey: one
+ *  definition, so the feed that writes it and the replica that hydrates from it
+ *  cannot drift apart. Uppercase because that is the case the cache is keyed by. */
+export function commodityKey(symbol: string): string {
+  return `commodity:${symbol.toUpperCase()}`;
 }

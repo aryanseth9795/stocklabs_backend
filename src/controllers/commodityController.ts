@@ -6,13 +6,7 @@ import { Prisma } from "@prisma/client";
 import { getLivePriceINR } from "../utils/priceCache.js";
 import { validateQuantity, validateEnum } from "../utils/validate.js";
 import { addSubscriber } from "../utils/commodityFeed.js";
-
-const COMMODITY_NAMES: Record<string, string> = {
-  GOLD: "Gold",
-  SILVER: "Silver",
-  CRUDEOIL: "Crude Oil",
-  COPPER: "Copper",
-};
+import { COMMODITY_NAMES } from "../constants/Commodities.js";
 
 // ─── SSE Relay ────────────────────────────────────────────────────────────────
 /**

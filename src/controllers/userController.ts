@@ -20,27 +20,87 @@ import {
   validateEmail,
 } from "../utils/validate.js";
 import crypto from "crypto";
+import { rCmd } from "../db/redis.js";
 
 type OtpRecord = {
   otp: string;
+  /** Informational. The authoritative expiry is the key's Redis TTL. */
   expiresAt: number;
   issuedAt: number;
+  /**
+   * Written once as 0 and never read. The live count is `otp:att:<email>`,
+   * incremented atomically — see the comment on the attempt cap below. It stays
+   * in the record so the stored blob keeps its documented shape; do not start
+   * reading it.
+   */
   attempts: number;
 };
 
 /**
- * In-memory OTP store: email → record.
+ * OTP state lives in Redis, keyed by email (review D-3).
  *
- * KNOWN LIMITATION (review D-3): this lives in process memory, so OTPs are lost
- * on restart and are only verifiable on the instance that issued them. Behind a
- * load balancer with N instances, roughly (N-1)/N of reset attempts fail. Move
- * to Redis (already a dependency and connected) with a native TTL.
+ * It used to be an in-process `Map`, which is a correctness bug the moment more
+ * than one instance serves traffic: an OTP is only verifiable on the instance
+ * that issued it, so roughly (N-1)/N of reset attempts fail; the resend cooldown
+ * is bypassable by landing on a different instance; and OTP_MAX_ATTEMPTS becomes
+ * an effective 5×N guesses. It also lost every pending OTP on restart.
+ *
+ * Three keys, each doing one job that Redis does natively and correctly:
+ *   • `otp:<email>`     the record, with a native TTL instead of a hand-rolled
+ *                       expiry comparison — an expired OTP is gone, not merely
+ *                       rejected
+ *   • `otp:cd:<email>`  the resend cooldown, claimed with SET NX so two
+ *                       simultaneous requests cannot both win. Separate from the
+ *                       record on purpose: it must keep holding after the OTP is
+ *                       consumed or expires
+ *   • `otp:att:<email>` the attempt counter, an atomic INCR so the cap is
+ *                       enforced fleet-wide
  */
-const otpStore = new Map<string, OtpRecord>();
+const otpKey = (email: string): string => `otp:${email}`;
+const otpCooldownKey = (email: string): string => `otp:cd:${email}`;
+const otpAttemptsKey = (email: string): string => `otp:att:${email}`;
 
 const OTP_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const OTP_TTL_SECONDS = OTP_TTL_MS / 1000;
 const OTP_MAX_ATTEMPTS = 5;
 const OTP_RESEND_COOLDOWN_MS = 60 * 1000; // 1 minute
+const OTP_RESEND_COOLDOWN_SECONDS = OTP_RESEND_COOLDOWN_MS / 1000;
+
+/** How long an OTP Redis command may take before the request is failed. */
+const OTP_REDIS_TIMEOUT_MS = 3_000;
+
+/**
+ * Run one OTP Redis command, failing CLOSED.
+ *
+ * If Redis is unreachable the reset flow returns 500. There is deliberately no
+ * in-process fallback: a fallback map would re-create the (N-1)/N failure rate
+ * AND split the attempt cap N ways, which is worse than a visible outage on one
+ * endpoint. The timeout is needed because the client's offline queue holds
+ * commands rather than rejecting them — without it a dead Redis produces a hung
+ * request instead of an error.
+ */
+async function otpRedis<T>(op: () => Promise<T>): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      op(),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`timed out after ${OTP_REDIS_TIMEOUT_MS}ms`)),
+          OTP_REDIS_TIMEOUT_MS,
+        );
+      }),
+    ]);
+  } catch (err) {
+    console.error("[OTP] Redis unavailable:", (err as Error)?.message ?? err);
+    throw new ErrorHandler(
+      "Password reset is temporarily unavailable. Please try again shortly.",
+      500,
+    );
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 /** Constant-time string comparison, so a wrong OTP can't be narrowed down by
  *  timing. Length is compared first because timingSafeEqual requires equal
@@ -50,6 +110,23 @@ function timingSafeEqualStr(a: string, b: string): boolean {
   const bufB = Buffer.from(b, "utf8");
   if (bufA.length !== bufB.length) return false;
   return crypto.timingSafeEqual(bufA, bufB);
+}
+
+/**
+ * Parse a stored OTP record, treating anything unreadable as "no OTP".
+ *
+ * The value now crosses a process boundary, so it is input rather than a local
+ * object: a truncated or hand-edited blob must produce the ordinary 400 telling
+ * the user to request a new code, not a 500 from JSON.parse or from
+ * timingSafeEqualStr being handed a non-string.
+ */
+function safeParseOtpRecord(raw: string): OtpRecord | null {
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed.otp === "string" ? (parsed as OtpRecord) : null;
+  } catch {
+    return null;
+  }
 }
 
 // Starting of Controller
@@ -461,8 +538,20 @@ export const requestPasswordReset = TryCatch(
 
     // Cooldown: without it this endpoint is an unauthenticated email-send
     // amplifier pointed at any address the caller chooses (S-10).
-    const existing = otpStore.get(normalisedEmail);
-    if (existing && Date.now() - existing.issuedAt < OTP_RESEND_COOLDOWN_MS) {
+    //
+    // SET NX EX is the check and the claim in one atomic round trip, so two
+    // requests arriving at two replicas in the same millisecond cannot both
+    // decide they are first. A null reply means someone already holds it.
+    const claimed = await otpRedis(() =>
+      rCmd.set(
+        otpCooldownKey(normalisedEmail),
+        "1",
+        "EX",
+        OTP_RESEND_COOLDOWN_SECONDS,
+        "NX",
+      ),
+    );
+    if (claimed === null) {
       return res.status(429).json({
         success: false,
         message: "An OTP was just sent. Please wait a minute before retrying.",
@@ -479,12 +568,24 @@ export const requestPasswordReset = TryCatch(
     // crypto.randomInt, not Math.random — this is a credential-reset token.
     const otp = String(crypto.randomInt(100000, 1000000));
     const now = Date.now();
-    otpStore.set(normalisedEmail, {
+    const record: OtpRecord = {
       otp,
       expiresAt: now + OTP_TTL_MS,
       issuedAt: now,
       attempts: 0,
-    });
+    };
+
+    await otpRedis(() =>
+      rCmd.set(
+        otpKey(normalisedEmail),
+        JSON.stringify(record),
+        "EX",
+        OTP_TTL_SECONDS,
+      ),
+    );
+    // A new code gets a new attempt budget, and this is also what stops a
+    // counter left behind by a burnt-out OTP from being charged against it.
+    await otpRedis(() => rCmd.del(otpAttemptsKey(normalisedEmail)));
 
     await sendOtpEmail(normalisedEmail, otp);
 
@@ -510,7 +611,11 @@ export const resetPasswordWithOtp = TryCatch(
 
     const normalisedEmail = String(email).trim().toLowerCase();
 
-    const record = otpStore.get(normalisedEmail);
+    // An expired OTP has been deleted by Redis rather than merely being past a
+    // stored timestamp, so "expired" and "never issued" are the same answer
+    // here: request a new one.
+    const raw = await otpRedis(() => rCmd.get(otpKey(normalisedEmail)));
+    const record = raw ? safeParseOtpRecord(raw) : null;
     if (!record)
       return next(
         new ErrorHandler(
@@ -519,18 +624,23 @@ export const resetPasswordWithOtp = TryCatch(
         ),
       );
 
-    if (Date.now() > record.expiresAt) {
-      otpStore.delete(normalisedEmail);
-      return next(
-        new ErrorHandler("OTP has expired. Please request a new one.", 400),
-      );
-    }
-
     // Attempt cap. A 6-digit code with unlimited guesses inside a 10-minute
     // window is 900k possibilities against no resistance at all (S-10).
-    record.attempts += 1;
-    if (record.attempts > OTP_MAX_ATTEMPTS) {
-      otpStore.delete(normalisedEmail);
+    //
+    // INCR, not an `attempts` field inside the record: read-modify-write on the
+    // stored JSON races both across replicas and across parallel requests on one
+    // replica, so an attacker firing 50 guesses at once would land all 50 before
+    // any of them wrote a count back. INCR is the whole cap in one operation.
+    // The counter carries the OTP's TTL so it cannot outlive the code it guards.
+    const attempts = await otpRedis(async () => {
+      const key = otpAttemptsKey(normalisedEmail);
+      const n = await rCmd.incr(key);
+      if (n === 1) await rCmd.expire(key, OTP_TTL_SECONDS);
+      return n;
+    });
+
+    if (attempts > OTP_MAX_ATTEMPTS) {
+      await otpRedis(() => rCmd.del(otpKey(normalisedEmail)));
       return next(
         new ErrorHandler(
           "Too many incorrect attempts. Please request a new OTP.",
@@ -549,7 +659,11 @@ export const resetPasswordWithOtp = TryCatch(
       data: { password: hashedPassword },
     });
 
-    otpStore.delete(normalisedEmail); // OTP consumed
+    // OTP consumed. The cooldown key is deliberately left in place: a used code
+    // is no reason to reopen the email-send amplifier for another minute.
+    await otpRedis(() =>
+      rCmd.del(otpKey(normalisedEmail), otpAttemptsKey(normalisedEmail)),
+    );
 
     res.status(200).json({
       success: true,

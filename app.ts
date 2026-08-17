@@ -17,7 +17,7 @@ import express from "express";
 import cors from "cors";
 import cookieParser from "cookie-parser";
 import { Server } from "socket.io";
-import RedisPkg from "ioredis";
+import { createAdapter } from "@socket.io/redis-adapter";
 import WebSocket from "ws";
 import errorMiddleware from "./src/middlewares/errorMiddleware.js";
 import { TOP50 } from "./src/constants/StockList.js";
@@ -25,8 +25,16 @@ import userRoute from "./src/routes/userRoute.js";
 import shortRoute from "./src/routes/shortRoute.js";
 import commodityRoute from "./src/routes/commodityRoute.js";
 import { Row } from "./src/types/types.js";
-import { startAutoCutJob } from "./src/utils/autoCutJob.js";
-import { startCommodityFeed } from "./src/utils/commodityFeed.js";
+import { startAutoCutJob, stopAutoCutJob } from "./src/utils/autoCutJob.js";
+import {
+  closeAllSubscribers,
+  hydrateCommoditiesFromRedis,
+  startCommodityConsumer,
+  startCommodityUpstream,
+  stopCommodityUpstream,
+  subscriberCount,
+  upstreamConnected,
+} from "./src/utils/commodityFeed.js";
 import {
   boardCache,
   boardSnapshot as buildBoardSnapshot,
@@ -37,34 +45,58 @@ import cookie from "cookie";
 import prisma from "./src/db/db.js";
 import axios from "axios";
 import { getUsdInrRate, usdToInr } from "./src/utils/exchangeRate.js";
-import { env } from "./src/config/env.js";
+import { env, isApi, isWorker } from "./src/config/env.js";
+import {
+  closeRedis,
+  connectRedis,
+  makeAdapterClients,
+  rCmd,
+  rSub,
+} from "./src/db/redis.js";
 import { verifyAccessToken } from "./src/utils/token.js";
 
 const PORT = env.PORT;
 const CLIENT_URL = env.CLIENT_URL;
-const REDIS_URL = env.REDIS_URL;
 // USD_INR is now fetched dynamically – see src/utils/exchangeRate.ts
 const ENVMODE = env.NODE_ENV;
 
-console.log(`Starting relay in ${ENVMODE} mode...`);
-const Redis: any = (RedisPkg as any).default || RedisPkg;
-const rCmd = new Redis(REDIS_URL);
-const rSub = new Redis(REDIS_URL);
+console.log(`Starting relay in ${ENVMODE} mode as ROLE=${env.ROLE}...`);
 
-// Neither client had ANY listener attached. ioredis emits "error" rather than
-// throwing, so a subscriber that never reconnected stayed silent forever — and
-// since boardCache is fed *only* by rSub's pmessage, that failure mode looks
-// exactly like an outage with no error anywhere in the log. Name the clients so
-// it is obvious which side broke.
-for (const [name, client] of [
-  ["rCmd", rCmd],
-  ["rSub", rSub],
-] as const) {
-  client.on("error", (err: Error) =>
-    console.error(`[Redis:${name}] ${err.message}`),
-  );
-  client.on("end", () => console.warn(`[Redis:${name}] connection closed`));
-  client.on("reconnecting", () => console.warn(`[Redis:${name}] reconnecting`));
+/**
+ * Every interval this process owns.
+ *
+ * They used to be anonymous, which was fine while the process only ever died by
+ * being killed. Now that shutdown is graceful, an uncleared timer keeps Node
+ * alive past the point where everything else has been torn down, so each one has
+ * to be reachable.
+ */
+const timers: NodeJS.Timeout[] = [];
+const track = (t: NodeJS.Timeout): NodeJS.Timeout => {
+  timers.push(t);
+  return t;
+};
+
+/** Set the moment SIGTERM arrives, so /readyz can drain before the socket closes. */
+let shuttingDown = false;
+/** True once the boot-time warm start has finished (or given up). */
+let hydrated = false;
+/** Epoch ms of the last upstream tick. Worker-only signal; 0 means "never". */
+let lastTickAt = 0;
+
+/**
+ * Is Postgres reachable? Memoised for 5s so that /readyz — which nginx, Docker
+ * and any future monitor all poll — cannot be turned into database load.
+ */
+let dbProbe = { at: 0, ok: false };
+async function dbReachable(): Promise<boolean> {
+  if (Date.now() - dbProbe.at < 5_000) return dbProbe.ok;
+  try {
+    await prisma.$queryRaw`SELECT 1`;
+    dbProbe = { at: Date.now(), ok: true };
+  } catch {
+    dbProbe = { at: Date.now(), ok: false };
+  }
+  return dbProbe.ok;
 }
 
 /**
@@ -102,13 +134,27 @@ const BINANCE_WS_BASE = "wss://stream.binance.com:9443";
 // Note: `sameSite` is a cookie attribute, not a CORS option — it used to be set
 // here and was silently ignored by the cors package. It lives in cookieOptions
 // in userController.ts, which is where it actually takes effect (S-22).
+// The production origin used to be hardcoded here, which meant a new deployment
+// domain required a rebuild. CORS_ORIGINS is a comma-separated list; the legacy
+// value stays as the default so nothing breaks if it is unset.
 const corsOptions = {
-  origin: ["https://stocklabs.aryantechie.in", CLIENT_URL],
+  origin: [
+    ...(env.CORS_ORIGINS
+      ? env.CORS_ORIGINS.split(",").map((o) => o.trim()).filter(Boolean)
+      : ["https://stocklabs.aryantechie.in"]),
+    CLIENT_URL,
+  ],
   methods: ["GET", "POST", "PUT", "DELETE"],
   credentials: true,
 };
 
 const app = express();
+
+// Behind nginx every request otherwise appears to come from the proxy's IP, so
+// req.ip is useless for logging and any future rate limiter would throttle the
+// entire fleet as a single client.
+app.set("trust proxy", 1);
+
 app.use(cors(corsOptions));
 app.use(express.json());
 app.use(cookieParser());
@@ -117,9 +163,87 @@ app.get("/ping", (req, res) => {
   res.json({ message: "Server is running" });
 });
 
-app.use("/api/v1/", userRoute);
-app.use("/api/v1/short", shortRoute);
-app.use("/api/v1/commodity", commodityRoute);
+// Only the api role serves the product. Mounting these on the worker too would
+// mean an nginx misconfiguration silently routes a trade to a process that is
+// not in the load balancer; leaving them off turns that into a loud 404.
+if (isApi) {
+  app.use("/api/v1/", userRoute);
+  app.use("/api/v1/short", shortRoute);
+  app.use("/api/v1/commodity", commodityRoute);
+}
+
+/**
+ * Liveness. Deliberately checks NOTHING.
+ *
+ * Liveness answers "is this process wedged?" If it probed Redis or Postgres, a
+ * ten-second blip would mark every container unhealthy at the same instant and
+ * the restart policy would cycle the whole fleet — turning a transient
+ * dependency hiccup into a real outage plus a thundering-herd reconnect. A
+ * liveness check that depends on shared infrastructure is an outage amplifier.
+ */
+app.get("/healthz", (_req, res) => {
+  res.json({
+    status: shuttingDown ? "shutting-down" : "ok",
+    role: env.ROLE,
+    pid: process.pid,
+    uptime: process.uptime(),
+    instance: process.env.HOSTNAME ?? null,
+  });
+});
+
+/**
+ * Readiness, governed by one rule: it may only FAIL on conditions that make
+ * *this* replica worse than its peers.
+ *
+ * A condition shared by every replica — a dead Binance feed, say — gets reported
+ * but never gates, because gating on it pulls the entire fleet out of rotation
+ * at once, which is strictly worse than serving degraded. The failing crypto
+ * orders already 503 on their own; the rest of the product keeps working.
+ */
+app.get("/readyz", async (_req, res) => {
+  const boardSymbols = Object.keys(boardCache).length;
+  const boardAgeMs = boardSymbols
+    ? Date.now() -
+      Math.max(...Object.values(boardCache).map((r) => r.tsMs ?? 0))
+    : null;
+
+  const checks: Record<string, unknown> = {
+    role: env.ROLE,
+    instance: process.env.HOSTNAME ?? null,
+    shuttingDown,
+    hydrated,
+    redisSub: rSub.status,
+    redisCmd: rCmd.status,
+    db: await dbReachable(),
+    boardSymbols,
+    boardAgeMs,
+    commodityUpstream: upstreamConnected(),
+    sseSubscribers: subscriberCount(),
+    sockets: userSockets.size + guestSockets.size,
+  };
+
+  const gates = isWorker
+    ? [
+        !shuttingDown,
+        checks.db === true,
+        rCmd.status === "ready",
+        // "Connected" is not "receiving data" — the geo-blocked futures endpoint
+        // held an open socket and sent nothing. There is exactly one worker, so
+        // here unhealthy IS the alert we want.
+        upstream?.readyState === WebSocket.OPEN,
+        Date.now() - lastTickAt < 30_000,
+      ]
+    : [
+        !shuttingDown,
+        hydrated,
+        checks.db === true,
+        // A replica whose subscription died has a permanently frozen board while
+        // its peers are fine — the canonical per-replica failure.
+        rSub.status === "ready",
+      ];
+
+  res.status(gates.every(Boolean) ? 200 : 503).json(checks);
+});
 
 // JSON 404 for unmatched routes, so clients get the same content type they get
 // everywhere else instead of Express's default HTML error page (S-23).
@@ -148,12 +272,32 @@ const io = new Server(server, {
 export { boardCache };
 const boardSnapshot = () => buildBoardSnapshot(BOARD);
 
-startAutoCutJob();
+/**
+ * Cross-replica Socket.IO.
+ *
+ * Its own client pair, NOT rSub. ioredis delivers every pattern message to every
+ * listener on a connection, so sharing rSub would push the adapter's
+ * msgpack-encoded payloads into the tick handler below, where JSON.parse throws
+ * and logs a parse error on every socket.io broadcast in the fleet.
+ */
+const adapterClients = makeAdapterClients();
+io.adapter(createAdapter(adapterClients.pub, adapterClients.sub));
+
+// Runs on the worker only: it force-closes shorts at midnight IST, and N
+// replicas would each scan every open position. The per-row conditional claim in
+// autoCutJob means they would not double-pay, but there is no reason to find out.
+if (isWorker) startAutoCutJob();
 
 // The server is the price authority for commodities, so it keeps its own
 // upstream subscription rather than depending on a client being connected
-// (review A-01).
-startCommodityFeed();
+// (review A-01). One level up, the same argument makes this worker-only: N
+// replicas would mean N connections to the third-party feed.
+if (isWorker) startCommodityUpstream(rCmd);
+
+// Both roles consume. The worker needs commodity prices too — the midnight
+// auto-cut closes commodity shorts — and consuming its own publishes keeps
+// exactly one cache-writing path in the codebase.
+startCommodityConsumer(rSub);
 
 /** Upstream ticks received since boot, and the value at the last report. */
 let upstreamMsgCount = 0;
@@ -177,7 +321,9 @@ async function hydrateBoardFromRedis(): Promise<void> {
 
   const ttlPipe = rCmd.pipeline();
   keys.forEach((k) => ttlPipe.ttl(k));
-  const ttlRes: [Error | null, number][] = await ttlPipe.exec();
+  // exec() resolves to null if the pipeline was discarded; treat that as "no TTL
+  // information", which the loop below already handles by skipping the key.
+  const ttlRes = (await ttlPipe.exec()) ?? [];
 
   let restored = 0;
   let skippedStale = 0;
@@ -241,15 +387,38 @@ async function logTop50FromRedis() {
   }
 }
 
-// Warm the board from Redis before the first snapshot log, so a redeploy does
-// not serve an empty board to every connected client until the next tick.
-hydrateBoardFromRedis()
-  .catch((err) => console.error("[Board] hydration failed:", err))
-  .finally(() => {
-    // log once on startup, then every minute
+/**
+ * Warm both caches from Redis before accepting traffic, so a redeploy does not
+ * serve an empty board — or 503 every commodity order — until the next tick.
+ *
+ * The race ceiling is deliberate. Hydration failing must never make the whole
+ * fleet unlistenable: after the timeout we listen anyway and report the degraded
+ * state on /readyz, which is a far better outcome than a Redis hiccup taking
+ * every replica offline at once.
+ */
+const HYDRATION_CEILING_MS = 10_000;
+
+async function warmStart(): Promise<void> {
+  const work = Promise.allSettled([
+    hydrateBoardFromRedis(),
+    hydrateCommoditiesFromRedis(rCmd),
+  ]);
+  const ceiling = new Promise((resolve) =>
+    setTimeout(resolve, HYDRATION_CEILING_MS).unref(),
+  );
+  await Promise.race([work, ceiling]);
+  hydrated = true;
+
+  // Worker only. upstreamMsgCount is incremented on the ingest path, which an
+  // api replica never runs — so there the delta is permanently 0 and the "price
+  // feed is DOWN" alarm below would fire every 60 seconds forever while the feed
+  // is perfectly healthy. That false alarm would teach you to ignore the one log
+  // line that actually matters. Api replicas report board health via /readyz.
+  if (isWorker) {
     logTop50FromRedis().catch(console.error);
-    setInterval(() => logTop50FromRedis().catch(console.error), 60 * 1000);
-  });
+    track(setInterval(() => logTop50FromRedis().catch(console.error), 60 * 1000));
+  }
+}
 
 /**
  * Clock time in IST, formatted for display.
@@ -313,7 +482,7 @@ function connectBinanceUpstream() {
 
   console.log("[Binance WS] Connecting upstream...");
   const ws = new WebSocket(
-    `${BINANCE_WS_BASE}/stream?streams=${BOARD_STREAM}`,
+    `${env.BINANCE_WS_BASE}/stream?streams=${BOARD_STREAM}`,
   );
   upstream = ws;
 
@@ -366,6 +535,7 @@ function connectBinanceUpstream() {
       if (!parsed.data) return;
       const row = normaliseTicker(parsed.data);
       upstreamMsgCount++;
+      lastTickAt = Date.now();
       const payload = JSON.stringify(row);
       await rCmd
         .pipeline()
@@ -417,15 +587,44 @@ function scheduleReconnect() {
   }, delay);
 }
 
-connectBinanceUpstream();
+/**
+ * Tear down the upstream for shutdown.
+ *
+ * Listeners come off first, exactly as in connectBinanceUpstream: the `close`
+ * handler would otherwise schedule a reconnect on the way out and keep the
+ * process alive past the point where everything else has been closed.
+ */
+function stopBinanceUpstream(): void {
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  if (upstream) {
+    upstream.removeAllListeners();
+    upstream.terminate();
+    upstream = null;
+  }
+}
+
+// Worker only. N replicas would mean N WebSocket connections to Binance from one
+// VM IP — which Binance rate-limits — plus N identical writes to the same Redis
+// keys and N copies of every tick fanned back out to all N subscribers.
+if (isWorker) connectBinanceUpstream();
 
 //// Redis → Socket.IO
 const BOARD_ROOM = "top50";
 const BOARD_BROADCAST_MS = 1000;
 let boardDirty = false;
 
+// BOTH roles subscribe, including the worker. The worker publishes ticks but
+// never writes boardCache — only this handler does — and the midnight auto-cut
+// reads boardCache through getLivePriceINR. A worker that skipped this would
+// have an empty board and silently skip every crypto short at 00:00 IST.
 rSub.psubscribe("tick.*");
-rSub.on("pmessage", (_pattern: string, _channel: string, raw: string) => {
+rSub.on("pmessage", (_pattern: string, channel: string, raw: string) => {
+  // The Socket.IO adapter has its own client pair, but this guard costs nothing
+  // and makes the failure mode impossible rather than merely unlikely.
+  if (!channel.startsWith("tick.")) return;
   try {
     const row: Row = JSON.parse(raw);
     const sym = (row.stocksymbol || row.stockName).toUpperCase();
@@ -442,31 +641,57 @@ rSub.on("pmessage", (_pattern: string, _channel: string, raw: string) => {
 // symbols at several ticks per second — to a room nobody ever joined, because
 // nothing in the codebase called socket.join() (S-13). Now clients opt in via
 // "board:subscribe", and the broadcast is throttled and skipped when idle.
-setInterval(() => {
-  if (!boardDirty) return;
-  const room = io.sockets.adapter.rooms.get(BOARD_ROOM);
-  if (!room || room.size === 0) return;
+//
+// `io.local` is load-bearing, not decoration. With the Redis adapter attached,
+// a plain `io.to(room)` is forwarded to every replica, and every replica
+// delivers it to its own room members — while every replica also runs this same
+// 1s interval. At three replicas each client would receive three board events
+// per second. The early-return above does not save you: it inspects the LOCAL
+// room map, which the adapter deliberately keeps local, so each replica passes
+// its own check and then broadcasts globally.
+//
+// Local is also simply correct here: every replica holds a complete boardCache
+// fed from the same Redis stream, so it can serve its own subscribers.
+if (isApi) {
+  track(
+    setInterval(() => {
+      if (!boardDirty) return;
+      const room = io.sockets.adapter.rooms.get(BOARD_ROOM);
+      if (!room || room.size === 0) return;
 
-  boardDirty = false;
-  io.to(BOARD_ROOM).emit("board", boardSnapshot());
-}, BOARD_BROADCAST_MS);
+      boardDirty = false;
+      io.local.to(BOARD_ROOM).emit("board", boardSnapshot());
+    }, BOARD_BROADCAST_MS),
+  );
+}
 
 //// track online users
+// Local bookkeeping only — these counts are now per-replica. Cross-replica
+// session enforcement goes through the adapter (see the connection handler).
 const userSockets = new Map<string, string>();
 const guestSockets = new Set<string>();
-setInterval(
-  () =>
-    console.table({
-      // IST too — these logs are read alongside the snapshot table, and mixing
-      // UTC and IST across the same console is how a stale feed gets misread.
-      time: istTime(),
-      users: userSockets.size,
-      guests: guestSockets.size,
-      total: userSockets.size + guestSockets.size,
-      id: guestSockets.size ? Array.from(guestSockets)[0] : null,
-    }),
-  60 * 1_000,
-);
+if (isApi) {
+  track(
+    setInterval(
+      () =>
+        console.table({
+          // IST too — these logs are read alongside the snapshot table, and
+          // mixing UTC and IST across the same console is how a stale feed gets
+          // misread.
+          time: istTime(),
+          // Per-replica now, so tag the row with the container that produced it
+          // — otherwise three replicas print three unrelated counts as though
+          // they were the same number moving.
+          instance: process.env.HOSTNAME ?? "local",
+          users: userSockets.size,
+          guests: guestSockets.size,
+          total: userSockets.size + guestSockets.size,
+          id: guestSockets.size ? Array.from(guestSockets)[0] : null,
+        }),
+      60 * 1_000,
+    ),
+  );
+}
 
 io.use((socket: Socket, next) => {
   try {
@@ -561,16 +786,23 @@ io.on("connection", async (sock) => {
   const uid = sock.data.userId as string | undefined;
   console.log("New socket connection:", sock.id, "User ID:", uid);
   if (uid) {
-    if (userSockets.has(uid))
-      io.sockets.sockets.get(userSockets.get(uid)!)?.disconnect();
+    // One session per user, across the whole fleet.
+    //
+    // This used to be `io.sockets.sockets.get(...)`, which only sees sockets on
+    // THIS process. Behind a load balancer a user who reconnected onto a second
+    // replica kept both sessions alive, each running its own 2s portfolio
+    // poller — duplicated streams and doubled DB reads (review D-5).
+    //
+    // A per-user room plus the Redis adapter makes the disconnect cluster-wide;
+    // `except` spares the socket that just arrived.
+    sock.join(`user:${uid}`);
+    io.in(`user:${uid}`).except(sock.id).disconnectSockets(true);
     userSockets.set(uid, sock.id);
   } else {
     guestSockets.add(sock.id);
   }
 
   sock.on("landing", () => {
-    console.log("landing");
-
     // send once right away
     sock.emit("landing", boardSnapshot());
 
@@ -712,10 +944,74 @@ function ping() {
 }
 
 if (env.API_URL) {
-  setInterval(ping, 720000);
+  track(setInterval(ping, 720000));
 } else {
   console.log("[Ping] API_URL not set — self-ping disabled.");
 }
+
+/**
+ * Graceful shutdown.
+ *
+ * There was none, which was survivable when the process only ever died by being
+ * killed. Under a load balancer with rolling restarts it is not: every scale-down
+ * would drop in-flight requests and yank live sockets.
+ */
+const DRAIN_DELAY_MS = 8_000;
+const SHUTDOWN_WATCHDOG_MS = 15_000;
+
+async function shutdown(signal: string): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[Shutdown] ${signal} received — draining...`);
+
+  // Always exit under our own power, comfortably inside compose's 45s
+  // stop_grace_period, so a hung teardown still produces a clean container exit.
+  setTimeout(() => {
+    console.error("[Shutdown] Watchdog fired — forcing exit.");
+    process.exit(1);
+  }, SHUTDOWN_WATCHDOG_MS).unref();
+
+  // /readyz now returns 503, but KEEP SERVING. This delay is what makes the
+  // restart actually zero-downtime: close the listener while the container's DNS
+  // record still exists and nginx sends requests into a closed port. That is
+  // retried for GETs but deliberately NOT for POSTs, so a user's order fails.
+  await new Promise((r) => setTimeout(r, DRAIN_DELAY_MS));
+
+  server.close();
+  server.closeIdleConnections?.();
+
+  // `.local` is mandatory. With the Redis adapter, a bare io.disconnectSockets()
+  // is fleet-wide — restarting one replica would disconnect every user on every
+  // replica, once per replica, turning a rolling deploy into a reconnect storm.
+  io.local.disconnectSockets(true);
+
+  // SSE responses never end on their own, and server.close() waits for every
+  // connection to finish — so a single attached stream would hang the container
+  // until SIGKILL, and its client would see a TCP reset instead of a clean end.
+  closeAllSubscribers();
+
+  if (isWorker) {
+    stopCommodityUpstream();
+    stopBinanceUpstream();
+    await stopAutoCutJob();
+  }
+
+  timers.forEach(clearInterval);
+
+  // Let in-flight handlers finish before pulling the data stores out from under
+  // them, then force whatever is left.
+  await new Promise((r) => setTimeout(r, 3_000));
+  server.closeAllConnections?.();
+
+  await prisma.$disconnect().catch(() => {});
+  await closeRedis([rCmd, rSub, adapterClients.pub, adapterClients.sub]);
+
+  console.log("[Shutdown] Clean exit.");
+  process.exit(0);
+}
+
+process.on("SIGTERM", () => void shutdown("SIGTERM"));
+process.on("SIGINT", () => void shutdown("SIGINT"));
 
 // Last line of defence. Without these, one stray rejection anywhere in the
 // socket or job code takes the process down with no usable diagnostic (S-09).
@@ -723,12 +1019,21 @@ process.on("unhandledRejection", (reason) => {
   console.error("[Fatal] Unhandled promise rejection:", reason);
 });
 
+// Unlike the above, an uncaught exception leaves the process in an unknown
+// state. Logging and carrying on kept a possibly-corrupt server serving traffic
+// — and because it never exited, the container restart policy could not help.
 process.on("uncaughtException", (err) => {
   console.error("[Fatal] Uncaught exception:", err);
+  void shutdown("uncaughtException").finally(() => process.exit(1));
 });
 
-// The exchange rate is a constant now, so there is nothing to seed and no
-// network call to await before accepting traffic.
+// Connect Redis, warm the caches, and only then accept traffic. Listening before
+// hydration means a fresh replica answers 503 on every trade until its board
+// fills; not listening at all means nginx gets ECONNREFUSED, which it retries
+// onto a warm peer — a far better signal than a 503 body.
+await connectRedis([rCmd, rSub, adapterClients.pub, adapterClients.sub]);
+await warmStart();
+
 server.listen(PORT, () => {
   console.log(
     `Relay ready on http://localhost:${PORT}  •  USD/INR fixed at ${getUsdInrRate()}`,

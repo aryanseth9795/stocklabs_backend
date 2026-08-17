@@ -4,4 +4,16 @@
 
 /generated/prisma
 
+# Secrets. .env.example is the committed template; everything else holds real
+# credentials and must never be committed OR copied into an image (.dockerignore
+# excludes them too).
 /.env
+/.env.*
+!/.env.example
+
+# Postgres dumps written by docker/scripts/backup.sh — a full copy of the
+# production database.
+/backups/
+
+# Let's Encrypt account keys, certificates and private keys.
+/certbot/
