@@ -25,5 +25,20 @@ export type Row = {
   /** ₹ — authoritative 24h change. */
   stockChangeINR: number;
   stockChangePercentage: number;
+  /**
+   * Display-only clock time of this tick, already formatted in IST.
+   *
+   * The server runs in UTC, so a bare toLocaleTimeString() rendered every price
+   * ~5h30m behind for an audience that is entirely in India. Formatting happens
+   * here, once, rather than in each client.
+   */
   ts: string;
+  /**
+   * Same instant as `ts`, as epoch milliseconds.
+   *
+   * `ts` is a localised string and cannot be compared or sorted, so clients that
+   * need "how fresh is this board?" (the single Last-updated line on the
+   * dashboard) use this instead of trying to parse the display value.
+   */
+  tsMs: number;
 };

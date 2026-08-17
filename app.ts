@@ -251,6 +251,21 @@ hydrateBoardFromRedis()
     setInterval(() => logTop50FromRedis().catch(console.error), 60 * 1000);
   });
 
+/**
+ * Clock time in IST, formatted for display.
+ *
+ * Render runs its containers in UTC, so `new Date().toLocaleTimeString()` with
+ * no arguments follows the *server's* locale — every tick reached the dashboard
+ * stamped 5h30m in the past. The platform's users are in India, so the timezone
+ * is pinned here rather than left to whatever host the process lands on.
+ *
+ * `en-US` is chosen over `en-IN` only for its uppercase AM/PM, matching what the
+ * UI already displayed. The timezone, not the locale, is what fixes the bug.
+ */
+function istTime(d: Date = new Date()): string {
+  return d.toLocaleTimeString("en-US", { timeZone: "Asia/Kolkata" });
+}
+
 //// normalize incoming ticker data
 // Binance quotes in USD; the platform trades in rupees. The INR fields are the
 // authoritative ones — everything that touches money (fills, balances, P&L, in
@@ -259,6 +274,7 @@ hydrateBoardFromRedis()
 function normaliseTicker(t: any): Row {
   const priceUsd = +t.c;
   const changeUsd = +t.p;
+  const now = new Date();
   return {
     stockName: `${t.s.toLowerCase()}`,
     stocksymbol: t.s,
@@ -267,7 +283,8 @@ function normaliseTicker(t: any): Row {
     stockChange: changeUsd, // informational only
     stockChangeINR: usdToInr(changeUsd),
     stockChangePercentage: +t.P,
-    ts: new Date().toLocaleTimeString(),
+    ts: istTime(now),
+    tsMs: now.getTime(),
   };
 }
 
@@ -440,7 +457,9 @@ const guestSockets = new Set<string>();
 setInterval(
   () =>
     console.table({
-      time: new Date().toLocaleTimeString(),
+      // IST too — these logs are read alongside the snapshot table, and mixing
+      // UTC and IST across the same console is how a stale feed gets misread.
+      time: istTime(),
       users: userSockets.size,
       guests: guestSockets.size,
       total: userSockets.size + guestSockets.size,
