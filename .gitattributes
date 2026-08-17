@@ -1,0 +1,29 @@
+# This repo is developed on Windows (core.autocrlf=true) and deployed to Linux
+# containers. Without these rules, git stores CRLF for files authored on Windows
+# and the VM checks them out that way.
+#
+# For a shell script that is fatal and the error is unhelpful: the shebang
+# becomes `#!/usr/bin/env bash\r`, and the kernel reports
+# `bad interpreter: /usr/bin/env bash^M: no such file or directory` — which
+# reads like the interpreter is missing rather than like a line-ending problem.
+#
+# Everything below is read by Linux tools, so everything below is LF.
+
+* text=auto eol=lf
+
+*.sh        text eol=lf
+Dockerfile  text eol=lf
+*.conf      text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.ts        text eol=lf
+*.json      text eol=lf
+*.prisma    text eol=lf
+*.md        text eol=lf
+.env.example text eol=lf
+
+# Never touched by git's newline conversion.
+*.png binary
+*.jpg binary
+*.ico binary
+*.node binary
