@@ -21,6 +21,7 @@ import {
 } from "../utils/validate.js";
 import crypto from "crypto";
 import { rCmd } from "../db/redis.js";
+import { istDayKey } from "../utils/istDay.js";
 
 type OtpRecord = {
   otp: string;
@@ -900,6 +901,37 @@ export const getProfitLoss = TryCatch(
       },
     );
 
+    // Daily realized P/L, for the account page's chart.
+    //
+    // The chart is a date axis, but this endpoint only ever returned per-symbol
+    // totals — so the client synthesised a timeline by walking backwards one day
+    // per array index, labelling the first symbol "today", the second
+    // "yesterday", and so on. Every date on that chart was fiction.
+    //
+    // Same definition as the total above (sells minus buys) so that
+    // sum(dailyPL) === realizedPL exactly; the chart and the stat card beside it
+    // can never disagree. Asserted in tests/profitLoss.test.ts.
+    const dailyTotals = new Map<string, number>();
+    for (const order of orders) {
+      const day = istDayKey(order.createdAt);
+      const delta =
+        order.type === "buy" ? -order.stockTotal : order.stockTotal;
+      dailyTotals.set(day, (dailyTotals.get(day) ?? 0) + delta);
+    }
+
+    // Zero-fill every day in the window. A day with no trades is a real zero,
+    // not a gap — and filling it here means the client never has to invent a
+    // data point, which is the failure this replaces.
+    const dailyPL: Array<{ date: string; value: number }> = [];
+    const cursor = new Date(startDate);
+    const todayKey = istDayKey(new Date());
+    for (let i = 0; i <= daysNum; i++) {
+      const key = istDayKey(cursor);
+      dailyPL.push({ date: key, value: dailyTotals.get(key) ?? 0 });
+      if (key === todayKey) break;
+      cursor.setDate(cursor.getDate() + 1);
+    }
+
     res.status(200).json({
       success: true,
       data: {
@@ -914,6 +946,7 @@ export const getProfitLoss = TryCatch(
             ? (totalBuyAmount + totalSellAmount) /
               (totalBuyCount + totalSellCount)
             : 0,
+        dailyPL,
         symbolBreakdown,
         period: `${daysNum} days`,
       },
